@@ -7,12 +7,16 @@ case "$command" in
     [[ "${1:-}" == --format ]] || exit 0
     case "$2" in
       *'.State.Running'*)
-        if [[ "$3" == mariadb ]]; then echo true; else cat "$MOCK_APP_STATE"; fi ;;
+        if [[ "$3" == mariadb || "$3" == grimmory-db ]]; then echo true; else cat "$MOCK_APP_STATE"; fi ;;
       *'.Config.Image'*) echo "${MOCK_IMAGE:-ghcr.io/grimmory/grimmory:1.0.0}" ;;
       *'{{.Image}}'*) echo "${MOCK_IMAGE_ID:-sha256:test-image}" ;;
       *'.Mounts'*) printf '/app/data\n/books\n/bookdrop\n' ;;
       *) exit 30 ;;
     esac
+    ;;
+  image)
+    [[ "$1" == inspect && "${@: -1}" == sha256:test-image ]]
+    printf 'ghcr.io/grimmory-tools/grimmory@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
     ;;
   stop) printf 'false\n' > "$MOCK_APP_STATE" ;;
   start) printf 'true\n' > "$MOCK_APP_STATE" ;;

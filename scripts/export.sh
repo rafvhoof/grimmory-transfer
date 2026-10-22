@@ -22,6 +22,10 @@ preflight
 assert_mounts
 [[ "$(state "$DB_CONTAINER")" == true ]] || die 'Database must be running'
 [[ "$(state "$APP_CONTAINER")" == true ]] || die 'Application must be running when starting export'
+SOURCE_APP_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$APP_CONTAINER")"
+SOURCE_APP_IMAGE_ID="$(docker inspect --format '{{.Image}}' "$APP_CONTAINER")"
+# Inspect the image actually used by the container, not a possibly repulled latest tag.
+SOURCE_APP_REPO_DIGEST="$(docker image inspect --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' "$SOURCE_APP_IMAGE_ID")"
 require tar; require awk; require df
 MIGRATION_ID="${MIGRATION_ID:-grimmory-$(date -u +%Y%m%dT%H%M%SZ)}"
 validate_migration_id "$MIGRATION_ID"
@@ -64,8 +68,9 @@ done
 cat > "$OUTPUT/manifest.txt" <<MANIFEST
 format=grimmory-transfer-v1
 created_utc=$(date -u +%FT%TZ)
-source_app_image=$(docker inspect --format '{{.Config.Image}}' "$APP_CONTAINER")
-source_app_image_id=$(docker inspect --format '{{.Image}}' "$APP_CONTAINER")
+source_app_image=$SOURCE_APP_IMAGE
+source_app_image_id=$SOURCE_APP_IMAGE_ID
+source_app_repo_digest=$SOURCE_APP_REPO_DIGEST
 source_db_image=$(docker inspect --format '{{.Config.Image}}' "$DB_CONTAINER")
 db_name=$DB_NAME
 source_container=$APP_CONTAINER
@@ -76,6 +81,9 @@ upload_bundle "$OUTPUT" "$MIGRATION_ID"
 SUCCESS=1
 echo "Export completed. Migration ID: $MIGRATION_ID"
 echo "Local staging copy: $OUTPUT"
+if [[ -n "$SOURCE_APP_REPO_DIGEST" ]]; then
+  echo "Destination GRIMMORY_IMAGE: $SOURCE_APP_REPO_DIGEST"
+fi
 if [[ "$LEAVE_GRIMMORY_STOPPED" == 1 ]]; then
   echo 'Source Grimmory is left stopped to prevent changes after the final export.'
 fi

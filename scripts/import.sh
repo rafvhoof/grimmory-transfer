@@ -21,11 +21,16 @@ fi
 verify_bundle "$SOURCE"
 SOURCE_IMAGE="$(metadata_value "$SOURCE" source_app_image)"
 TARGET_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$APP_CONTAINER")"
-[[ -n "$SOURCE_IMAGE" && "$SOURCE_IMAGE" == "$TARGET_IMAGE" ]] || die "Image mismatch: source is $SOURCE_IMAGE; target is $TARGET_IMAGE. Pin the same Grimmory image before importing."
 SOURCE_IMAGE_ID="$(metadata_value "$SOURCE" source_app_image_id)"
+[[ -n "$SOURCE_IMAGE" ]] || die 'Backup manifest has no source_app_image'
 if [[ -n "$SOURCE_IMAGE_ID" ]]; then
-  [[ "$SOURCE_IMAGE_ID" == "$(docker inspect --format '{{.Image}}' "$APP_CONTAINER")" ]] || die 'Grimmory image contents differ despite matching tags; pin the same image digest before importing'
+  # A source tagged latest and a target pinned by digest can be identical images.
+  [[ "$SOURCE_IMAGE_ID" == "$(docker inspect --format '{{.Image}}' "$APP_CONTAINER")" ]] || die "Image mismatch: source is $SOURCE_IMAGE; target is $TARGET_IMAGE with different contents. Pin the running source image digest before importing."
+else
+  [[ "$SOURCE_IMAGE" == "$TARGET_IMAGE" ]] || die "Image mismatch: source is $SOURCE_IMAGE; target is $TARGET_IMAGE. This legacy bundle has no image ID; use the same reference or make a new export."
 fi
+SOURCE_DB_NAME="$(metadata_value "$SOURCE" db_name)"
+[[ -z "$SOURCE_DB_NAME" || "$SOURCE_DB_NAME" == "$DB_NAME" ]] || die "Database name mismatch: source is $SOURCE_DB_NAME; target is $DB_NAME. Preserve the source database name when modernizing Compose."
 # Fail closed if app volumes are not empty. Intentional destructive replacement must be performed manually.
 for path in /app/data /books /bookdrop; do
   docker run --rm --volumes-from "$APP_CONTAINER":ro "$IMAGE" sh -c \

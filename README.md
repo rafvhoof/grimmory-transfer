@@ -29,16 +29,53 @@ Grimmory needs filesystem archives to preserve its Docker mount contents and Uni
 | `/app/data` | `app-data.tar.gz` | Application state, covers, metadata cache and uploaded data |
 | `/books` | `books.tar.gz` | Managed book library |
 | `/bookdrop` | `bookdrop.tar.gz` | Incoming book files |
-| Docker inspection | `manifest.txt` | Source image reference, image ID, database name and mount paths |
+| Docker inspection | `manifest.txt` | Source image reference, image ID, registry digest, database name and mount paths |
 | Bundle files | `SHA256SUMS` | SHA-256 checksums for all five artifacts |
 
 The app must have **three separate Docker mounts at those exact container paths**. Extra library mounts, externally referenced files, symlink targets, configuration outside these mounts, external authentication and reverse proxy secrets need separate migration. Source `.env` and Compose secrets are not exported; reconfigure applicable settings on the new host.
+
+## Your existing BookLore-era source
+
+Your supplied Compose file already uses `ghcr.io/grimmory-tools/grimmory:latest`. Keep that source installation as it is for export; the new destination can use the `grimmory` names and current configuration conventions. Upstream's [BookLore upgrade guidance](https://github.com/grimmory-tools/grimmory/blob/develop/deploy/compose/docker-compose.yml) preserves existing database names/users and data, and the [installation guide](https://grimmory.org/docs/installation/) uses `SERVER_PORT` for the app port.
+
+| Setting | Existing source | New destination example |
+|---|---|---|
+| App service/container | `booklore` | `grimmory` |
+| Database service/container | `mariadb` | `grimmory-db` |
+| MariaDB image | `lscr.io/linuxserver/mariadb:11.4.5` | `lscr.io/linuxserver/mariadb:11.4.8`, as in the upstream Compose example |
+| App data | `/mnt/booklore/data` | `./grimmory/data` in Arr stack |
+| Books | `/mnt/booklore/books` | `/mnt/media/books`, or another empty destination library |
+| BookDrop | `/mnt/booklore/bookdrop` | `./grimmory/bookdrop` in Arr stack |
+| Database files | `./mariadb/config` on source | `./grimmory/database` on destination; migrated by SQL dump |
+| App port setting | `BOOKLORE_PORT` | `SERVER_PORT=6060` inside Docker; `GRIMMORY_PORT` selects the host port |
+| Database name and user | Actual `MYSQL_DATABASE` and `DB_USER` from the source `.env` | Preserve those values, even if named `booklore` |
+
+The posted Compose file does not show the actual database name or username. Read them from the source `.env`, or inspect these non-secret fields:
+
+```bash
+docker inspect mariadb --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | sed -n '/^MYSQL_DATABASE=/p; /^MYSQL_USER=/p'
+docker inspect booklore --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | sed -n '/^USER_ID=/p; /^GROUP_ID=/p; /^TZ=/p'
+```
+
+Configure `/etc/grimmory-transfer.env` on this source with `APP_CONTAINER=booklore`, `DB_CONTAINER=mariadb`, and the actual database name, username and password. Renaming the destination service does not require renaming the database; keeping its name also preserves qualified SQL references and routines.
+
+Obtain the registry digest of the image used by the **running** source container before preparing the destination:
+
+```bash
+docker inspect booklore --format '{{.Config.Image}}'
+docker image inspect "$(docker inspect booklore --format '{{.Image}}')" \
+  --format '{{range .RepoDigests}}{{println .}}{{end}}'
+```
+
+Copy the complete `ghcr.io/grimmory-tools/grimmory@sha256:...` value into the destination's `GRIMMORY_IMAGE`. Inspecting the container's image ID avoids selecting a different image if `latest` was pulled after the container started. Export also records a registry digest and prints it when available. Keep a private copy of the original Compose file and `.env` for reference and rollback.
 
 ## 1. Prepare both hosts
 
 Both hosts need Docker Engine, Docker Compose, Bash 4+, GNU/Linux utilities (`tar`, `sha256sum`, `df`, `awk`, `timeout`, etc.) and Docker access. MariaDB containers must contain `mariadb` and `mariadb-dump`. The database and its user must already exist on the destination, with appropriate dump/import permissions.
 
-Use the **same Grimmory image reference and image contents** on both hosts for the first boot. Pin a version or digest rather than a moving tag such as `latest`. MariaDB versions must also support the dump syntax. Upgrade only after validating migration.
+Use the **same Grimmory image contents** on both hosts for the first boot. A source tagged `latest` and a destination pinned by digest are accepted when their image IDs match. Pin the destination to the running source digest; upgrading the app is a separate step after validating migration. MariaDB versions must also support the dump syntax; the example moves within MariaDB 11.4 from your 11.4.5 source to the upstream 11.4.8 image using a logical dump.
 
 Clone this repository on each host:
 
@@ -64,6 +101,8 @@ DB_USER=grimmory
 DB_PASSWORD='your-database-password'
 ```
 
+For your source, change the example to `APP_CONTAINER=booklore`, `DB_CONTAINER=mariadb`. For the supplied destination Compose example, use `APP_CONTAINER=grimmory`, `DB_CONTAINER=grimmory-db`. Set `DB_NAME` to the source `MYSQL_DATABASE` on **both** hosts, and use the corresponding host's database password.
+
 `NC_URL` is the Nextcloud **base URL**, including any installation subdirectory, without `/remote.php/dav/...`. The scripts build the WebDAV endpoint and URL-encode `NC_USER`. Use the Nextcloud user ID shown in your Files WebDAV settings. Create an app password under **Personal settings > Security**; keep the migration folder private. See the [Nextcloud WebDAV guide](https://docs.nextcloud.com/server/stable/user_manual/en/files/access_webdav.html).
 
 Configuration is sourced by Bash, so quote values containing spaces or shell characters. Selection order is an explicit `TRANSFER_ENV_FILE`, then `/etc/grimmory-transfer.env`, then a repository-local `.env`. An explicitly selected missing file is an error. `.env.example` remains available for the local-file option. The old `NEXTCLOUD_*` settings have been replaced by the Paperless-compatible `NC_*` names.
@@ -72,15 +111,15 @@ If rclone is missing, the scripts install the Debian/Ubuntu distribution package
 
 ## 2. Inspect mounts and staging space
 
-On both hosts:
+On your source:
 
 ```bash
-docker inspect grimmory --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
-docker inspect grimmory --format '{{.Config.Image}}'
+docker inspect booklore --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
+docker inspect booklore --format '{{.Config.Image}}'
 docker inspect mariadb --format '{{.Config.Image}}'
 ```
 
-Use actual container names, which may be prefixed by a Compose project. Preserve `/app/data`, `/books` and `/bookdrop` inside the destination app. For NFS-backed ebooks, mount the share on the host and bind it to `/books`; verify permissions and Grimmory's `DISK_TYPE=NETWORK` setting when applicable.
+On the destination, inspect `grimmory` and `grimmory-db` instead. Use actual container names, which may be prefixed by a Compose project. Preserve `/app/data`, `/books` and `/bookdrop` inside the destination app. For NFS-backed ebooks, mount the share on the host and bind it to `/books`; verify permissions and Grimmory's `DISK_TYPE=NETWORK` setting when applicable.
 
 The default local staging directory on both hosts is:
 
@@ -134,16 +173,42 @@ The remote ID is still timestamped unless you configure `MIGRATION_ID` explicitl
 
 ## 4. Prepare the destination Arr VM
 
-Create Grimmory and a dedicated MariaDB service in your Compose stack. Pin the source Grimmory image and provide the same three in-container mount destinations. Create the Grimmory container without starting the app; start only MariaDB:
+Use [compose/grimmory.yml](compose/grimmory.yml) and [compose/grimmory.env.example](compose/grimmory.env.example) as the destination service definitions and settings. They follow the upstream Grimmory layout with a dedicated `grimmory-db`, current MariaDB 11.4 image, `SERVER_PORT=6060`, the three required mounts, and a health-dependent database startup.
+
+Replace the existing `grimmory` / `grimmory-db` blocks in your Arr Compose file with the reviewed example, retaining the rest of the stack and its `arr` network. Merge the environment example into the Arr stack's existing private `.env`. The sample is a complete service definition, so replace the old service blocks rather than layering conflicting mount definitions over them.
+
+Set these values before creating containers:
+
+| Destination setting | Value to use |
+|---|---|
+| `GRIMMORY_IMAGE` | Full registry digest of the running source image, from the inspection command above |
+| `GRIMMORY_DB_NAME` | Source `MYSQL_DATABASE`; do not automatically change it to `grimmory` |
+| `GRIMMORY_DB_USER` | Source `DB_USER` |
+| `GRIMMORY_DB_PASSWORD` | App/database password for the fresh target; also set this as target transfer `DB_PASSWORD` |
+| `GRIMMORY_DB_ROOT_PASSWORD` | Separate strong password for the fresh target database |
+| `PUID` / `PGID` | Existing Arr account; compare with old `APP_USER_ID` / `APP_GROUP_ID` and adjust restored ownership if needed |
+| `DB_USER_ID` / `DB_GROUP_ID` | Desired owner of target MariaDB files; compare with the source's values |
+| `TZ` | Keep your existing timezone |
+| `GRIMMORY_PORT` | Existing `BOOKLORE_PORT` value if you want to keep the external port; otherwise `6060` |
+| `GRIMMORY_BOOKS_PATH` | Empty target library, default `/mnt/media/books` on the mounted NAS |
+| `GRIMMORY_DISK_TYPE` | `NETWORK` for NFS/SMB, `LOCAL` for local disk |
+| `GRIMMORY_BOOKS_ACCESS` | `rw` during restore |
+
+Both passwords and the image are required, so an unconfigured example fails Compose validation. For a Bindery-managed library, stop acquisition and any other writers during the migration; the destination library must still be empty. After validation, you can change `GRIMMORY_BOOKS_ACCESS` to `ro` and recreate the Grimmory container to restore the Arr stack's read-only library policy.
+
+Create the Grimmory container without starting the app; start only its database:
 
 ```bash
 cd ~/arr-stack
+docker compose config --quiet
+docker compose up -d grimmory-db
 docker compose create grimmory
-docker compose up -d mariadb
 docker compose stop grimmory
 ```
 
-Substitute your actual service names. An initialized destination requires a separate verified backup and deliberately provisioned fresh database and mounts. The import never deletes existing data and has no nonempty-target bypass.
+The image's normal healthcheck targets the internal port 6060, independent of the chosen host port. The transfer configuration on this host must use `APP_CONTAINER=grimmory`, `DB_CONTAINER=grimmory-db`, `DB_NAME=<GRIMMORY_DB_NAME>`, `DB_USER=<GRIMMORY_DB_USER>` and `DB_PASSWORD=<GRIMMORY_DB_PASSWORD>`.
+
+Substitute your actual service names if different. An initialized destination requires a separate verified backup and deliberately provisioned fresh database and mounts. The import never deletes existing data and has no nonempty-target bypass. Leave the source Compose and live database storage intact.
 
 ## 5. Download and import on the destination VM
 
@@ -156,7 +221,7 @@ sudo env CONFIRM_REPLACE=YES bash scripts/import.sh
 
 Without an argument, import selects the newest completed `grimmory-YYYYMMDDTHHMMSSZ` folder under `NC_REMOTE_ROOT`, skipping folders with no `SHA256SUMS` or an `UPLOAD-PENDING.txt` marker. Set `MIGRATION_ID` in the configuration to choose a specific bundle, including one with a custom name.
 
-Import downloads into the local staging directory, verifies all five artifact checksums and the three archives, and checks the source Grimmory image against the destination. If the bundle records an image ID, the underlying image contents must also match. It reads metadata as text, never as executable shell configuration.
+Import downloads into the local staging directory, verifies all five artifact checksums and the three archives, and checks the source Grimmory image against the destination. If the bundle records an image ID, identical image contents are required even when tag/digest references differ; older bundles without an ID require the same image reference. It also checks the source database name when recorded. It reads metadata as text, never as executable shell configuration.
 
 Before restoring anything, import also requires the destination app to be stopped, MariaDB to be running, the database to have zero tables and all three mounts to be empty. `CONFIRM_REPLACE=YES` is an acknowledgement, not an override of these checks. It restores mount contents and imports the SQL dump, retaining the downloaded bundle.
 
@@ -199,10 +264,13 @@ sudo env CONFIRM_REPLACE=YES bash scripts/import.sh /mnt/backup/grimmory-final
 5. Check ownership, NAS access, extra mounts, external authentication and reverse proxy settings.
 6. Keep the old VM stopped as rollback, then take a fresh backup of the destination.
 
+Once the restored instance is working and backed up, choose a newer stable Grimmory version or digest from the [official releases](https://github.com/grimmory-tools/grimmory/releases), update `GRIMMORY_IMAGE` in the destination `.env`, then run `docker compose pull grimmory` and `docker compose up -d grimmory` there. Review release notes before upgrading; keep the migration's first boot on the source image. Service renaming and modern Compose settings are already in place during the transfer.
+
 ## Troubleshooting and security
 
 - **Incomplete upload:** A pending marker or missing `SHA256SUMS` blocks import. Retry upload from the retained local bundle using the same migration ID. Automatic selection may use an older completed bundle, so set `MIGRATION_ID` explicitly for final cutover.
-- **Image mismatch:** Pin the same source image and digest on the destination. Older v1 bundles without an image ID are checked by image reference only.
+- **Image mismatch:** Pin the running source image digest on the destination. With a recorded image ID, different references are accepted only for identical image contents. Older v1 bundles without an image ID are checked by image reference only.
+- **Database name mismatch:** Keep the source `MYSQL_DATABASE` in destination `GRIMMORY_DB_NAME` and transfer `DB_NAME`. A service named `grimmory-db` can serve a database still named `booklore`.
 - **Partial import:** Provision a newly empty destination or restore its pre-migration snapshot before retrying. Never blindly delete database or mounted files.
 - **Nextcloud access:** Check the base URL, app password, quota, routing, TLS and reverse proxy limits. Set `RCLONE_CA_CERT` for a private CA; keep certificate verification enabled. `NC_CONNECT_TIMEOUT` and `NC_IO_TIMEOUT` default to 10 and 30 seconds.
 - **Credential handling:** Keep the real transfer file mode `600`. Each transfer run creates a private temporary rclone configuration and removes it on exit. The app password is passed to `rclone obscure` over stdin; obscuring is reversible, not encryption at rest. Local Docker access and process inspection are privileged.

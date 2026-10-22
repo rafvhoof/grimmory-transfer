@@ -32,7 +32,7 @@ printf 'Book content\n' > "$MOCK_CONTENT/book.txt"
 ARTIFACTS=(database.sql app-data.tar.gz books.tar.gz bookdrop.tar.gz manifest.txt)
 SOURCE="$TEST_ROOT/source backup"
 printf 'SELECT 1;\n' > "$SOURCE/database.sql"
-printf 'format=grimmory-transfer-v1\nsource_app_image=ghcr.io/grimmory/grimmory:1.0.0\nsource_app_image_id=sha256:test-image\n' > "$SOURCE/manifest.txt"
+printf 'format=grimmory-transfer-v1\nsource_app_image=ghcr.io/grimmory/grimmory:1.0.0\nsource_app_image_id=sha256:test-image\ndb_name=grimmory\n' > "$SOURCE/manifest.txt"
 for file in app-data.tar.gz books.tar.gz bookdrop.tar.gz; do
   tar -czf "$SOURCE/$file" -C "$MOCK_CONTENT" .
 done
@@ -109,9 +109,13 @@ assert_configs_cleaned
 printf 'PASS: invalid migration paths, missing configuration and invalid commands fail safely\n'
 
 # Export exercises source stop/restart and failures without contacting Docker.
+export APP_CONTAINER=booklore
 export MIGRATION_ID=grimmory-20261022T130000Z
 bash "$TEST_ROOT/host/scripts/export.sh" > /dev/null
 [[ "$(cat "$MOCK_APP_STATE")" == true && -f "$REMOTE_ROOT/$MIGRATION_ID/SHA256SUMS" ]]
+grep -Fxq 'source_container=booklore' "$BACKUP_DIR/$MIGRATION_ID/manifest.txt"
+grep -q '^source_app_repo_digest=ghcr.io/grimmory-tools/grimmory@sha256:' "$BACKUP_DIR/$MIGRATION_ID/manifest.txt"
+grep -q 'docker image inspect.*sha256:test-image$' "$MOCK_LOG"
 export MIGRATION_ID=grimmory-20261022T140000Z LEAVE_GRIMMORY_STOPPED=1
 bash "$TEST_ROOT/host/scripts/export.sh" > /dev/null
 [[ "$(cat "$MOCK_APP_STATE")" == false ]]
@@ -135,22 +139,27 @@ export MOCK_NO_SPACE=1
 expect_failure bash "$TEST_ROOT/host/scripts/export.sh"
 ! grep -q 'docker stop' "$MOCK_LOG"
 unset MOCK_NO_SPACE
+unset APP_CONTAINER
 assert_configs_cleaned
 printf 'PASS: integrated export uploads, restarts by default, supports cutover and recovers from failures\n'
 
 # Import must block every failure before any destination restore operation.
 printf 'false\n' > "$MOCK_APP_STATE"
+export DB_CONTAINER=grimmory-db
 expect_failure env -u CONFIRM_REPLACE bash "$TEST_ROOT/host/scripts/import.sh" "$SOURCE"
 assert_no_writes
-export CONFIRM_REPLACE=YES MOCK_IMAGE=ghcr.io/grimmory/grimmory:2.0.0
+export CONFIRM_REPLACE=YES MOCK_IMAGE=ghcr.io/grimmory/grimmory:2.0.0 MOCK_IMAGE_ID=sha256:other-version
 expect_failure bash "$TEST_ROOT/host/scripts/import.sh" "$SOURCE"
 grep -q 'Image mismatch' "$TEST_ROOT/failure.log"
 assert_no_writes
-unset MOCK_IMAGE
+unset MOCK_IMAGE MOCK_IMAGE_ID
 export MOCK_IMAGE_ID=sha256:different-image
 expect_failure bash "$TEST_ROOT/host/scripts/import.sh" "$SOURCE"
 assert_no_writes
 unset MOCK_IMAGE_ID
+expect_failure env DB_NAME=different-database bash "$TEST_ROOT/host/scripts/import.sh" "$SOURCE"
+grep -q 'Database name mismatch' "$TEST_ROOT/failure.log"
+assert_no_writes
 export MOCK_TABLES=1
 expect_failure bash "$TEST_ROOT/host/scripts/import.sh" "$SOURCE"
 assert_no_writes
@@ -171,3 +180,25 @@ printf 'PASS: integrated import verifies images, checks empty targets and restor
 bash "$TEST_ROOT/host/scripts/import.sh" "$SOURCE" > /dev/null
 ! grep -q '^rclone ' "$MOCK_LOG"
 printf 'PASS: importing an existing local bundle does not require Nextcloud\n'
+
+# The source latest tag can be replaced by a digest pin without changing contents.
+: > "$MOCK_WRITES"
+export MOCK_IMAGE=ghcr.io/grimmory-tools/grimmory@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+bash "$TEST_ROOT/host/scripts/import.sh" "$SOURCE" > /dev/null
+[[ "$(wc -l < "$MOCK_WRITES")" -eq 4 ]]
+printf 'PASS: digest-pinned target accepts identical image contents across different references\n'
+
+# Old manifests without an image ID must retain the stricter reference check.
+LEGACY_SOURCE="$TEST_ROOT/legacy backup"
+mkdir "$LEGACY_SOURCE"
+for file in "${ARTIFACTS[@]}"; do cp "$SOURCE/$file" "$LEGACY_SOURCE/$file"; done
+sed -i '/^source_app_image_id=/d' "$LEGACY_SOURCE/manifest.txt"
+(cd "$LEGACY_SOURCE" && sha256sum "${ARTIFACTS[@]}" > SHA256SUMS)
+: > "$MOCK_WRITES"
+expect_failure bash "$TEST_ROOT/host/scripts/import.sh" "$LEGACY_SOURCE"
+grep -q 'legacy bundle has no image ID' "$TEST_ROOT/failure.log"
+assert_no_writes
+unset MOCK_IMAGE
+bash "$TEST_ROOT/host/scripts/import.sh" "$LEGACY_SOURCE" > /dev/null
+[[ "$(wc -l < "$MOCK_WRITES")" -eq 4 ]]
+printf 'PASS: legacy manifests require matching image references\n'

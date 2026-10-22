@@ -1,0 +1,57 @@
+# Destination services for a fresh Arr stack migration.
+# Merge these service blocks and environment settings into your existing stack.
+# Source: https://github.com/grimmory-tools/grimmory/blob/develop/deploy/compose/docker-compose.yml
+services:
+  grimmory:
+    image: "${GRIMMORY_IMAGE:?GRIMMORY_IMAGE_required}"
+    container_name: grimmory
+    environment:
+      USER_ID: ${PUID:-1000}
+      GROUP_ID: ${PGID:-1000}
+      TZ: ${TZ:-Europe/Amsterdam}
+      SERVER_PORT: "6060"
+      DATABASE_URL: jdbc:mariadb://grimmory-db:3306/${GRIMMORY_DB_NAME:?Copy the source MYSQL_DATABASE}
+      DATABASE_USERNAME: ${GRIMMORY_DB_USER:?Copy the source DB_USER}
+      DATABASE_PASSWORD: ${GRIMMORY_DB_PASSWORD:?Set GRIMMORY_DB_PASSWORD}
+      SWAGGER_ENABLED: "false"
+      FORCE_DISABLE_OIDC: "false"
+      DISK_TYPE: ${GRIMMORY_DISK_TYPE:-NETWORK}
+    depends_on:
+      grimmory-db:
+        condition: service_healthy
+    ports:
+      - "${GRIMMORY_PORT:-6060}:6060"
+    volumes:
+      - ./grimmory/data:/app/data
+      - ${GRIMMORY_BOOKS_PATH:?Set GRIMMORY_BOOKS_PATH to an empty target library}:/books:${GRIMMORY_BOOKS_ACCESS:-rw}
+      - ./grimmory/bookdrop:/bookdrop
+    networks:
+      - arr
+    restart: unless-stopped
+
+  grimmory-db:
+    image: ${GRIMMORY_DB_IMAGE:-lscr.io/linuxserver/mariadb:11.4.8}
+    container_name: grimmory-db
+    environment:
+      PUID: ${DB_USER_ID:-1000}
+      PGID: ${DB_GROUP_ID:-1000}
+      TZ: ${TZ:-Europe/Amsterdam}
+      MYSQL_ROOT_PASSWORD: ${GRIMMORY_DB_ROOT_PASSWORD:?Set GRIMMORY_DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${GRIMMORY_DB_NAME:?Copy the source MYSQL_DATABASE}
+      MYSQL_USER: ${GRIMMORY_DB_USER:?Copy the source DB_USER}
+      MYSQL_PASSWORD: ${GRIMMORY_DB_PASSWORD:?Set GRIMMORY_DB_PASSWORD}
+    volumes:
+      - ./grimmory/database:/config
+    networks:
+      - arr
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+networks:
+  arr:
+    driver: bridge
