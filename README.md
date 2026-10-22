@@ -159,9 +159,13 @@ Before stopping the app, export checks the containers, mounts, available staging
 Nextcloud / GrimmoryMigration / grimmory-YYYYMMDDTHHMMSSZ /
 ```
 
+Export prints each preparation step, including a separate size scan for each mount. Short Docker operations have a `DOCKER_TIMEOUT` of 30 seconds; each mount scan has a `SPACE_SCAN_TIMEOUT` of 1800 seconds, including utility image startup or pulling. Both settings accept positive integer seconds in the transfer configuration. Allow more scan time for large or slow network libraries. If one of these bounded operations ignores termination, its Docker client is forcefully stopped after another five seconds. Archives and database dumps have no size-related time limit.
+
+If export stalls, the last printed step identifies the operation to investigate. A stall at `Checking Docker access` points to Docker access or the daemon; a stall at `Estimating /books size` can also involve utility image startup or the filesystem backing that mount. Inspect the Docker service and source mounts on the source VM. The message `got 3 SIGTERM/SIGINTs, forcefully exiting` comes from Docker after repeated interrupts and does not identify the original cause. Backup helper containers use an init process to forward interrupts, and export attempts to remove an unfinished helper during cleanup.
+
 The script stops Grimmory, leaves MariaDB online, dumps the database, archives the three mounts, records source metadata, verifies the bundle, and uploads it with parallel rclone copies. It publishes `SHA256SUMS` after the other files, checks that all six remote files exist, and removes the pending marker only after success.
 
-On any export/upload failure after stopping the app, it attempts to restart the source. On success it restarts the app unless `LEAVE_GRIMMORY_STOPPED=1`. For final cutover, keep the old app stopped and do not allow further changes after the snapshot.
+On any export/upload failure or interrupt after stopping the app, it attempts to restart the source. On success it restarts the app unless `LEAVE_GRIMMORY_STOPPED=1`. For final cutover, keep the old app stopped and do not allow further changes after the snapshot.
 
 The final output gives the migration ID and local staging path. An optional argument chooses a different local staging directory:
 

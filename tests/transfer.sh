@@ -8,6 +8,13 @@ cleanup() {
   rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT
+report_failure() {
+  echo "FAIL: integration test at line $1" >&2
+  if [[ -f "$TEST_ROOT/failure.log" ]]; then
+    cat "$TEST_ROOT/failure.log" >&2
+  fi
+}
+trap 'report_failure "$LINENO"' ERR
 mkdir -p "$TEST_ROOT/host/scripts" "$TEST_ROOT/bin" "$TEST_ROOT/remote" "$TEST_ROOT/source backup" "$TEST_ROOT/content"
 cp "$ROOT/scripts/"*.sh "$TEST_ROOT/host/scripts/"
 cp "$ROOT/tests/helpers/"* "$TEST_ROOT/bin/"
@@ -142,6 +149,52 @@ unset MOCK_NO_SPACE
 unset APP_CONTAINER
 assert_configs_cleaned
 printf 'PASS: integrated export uploads, restarts by default, supports cutover and recovers from failures\n'
+
+# Export failures before stopping the app must be visible and bounded.
+export APP_CONTAINER=booklore DOCKER_TIMEOUT=1 MOCK_HANG_DOCKER=inspect
+: > "$MOCK_LOG"
+expect_failure bash "$TEST_ROOT/host/scripts/export.sh"
+grep -q 'Checking Docker access to app container: booklore' "$TEST_ROOT/failure.log"
+grep -q 'Docker inspect timed out after 1s' "$TEST_ROOT/failure.log"
+! grep -q 'docker stop' "$MOCK_LOG"
+[[ "$(cat "$MOCK_APP_STATE")" == true ]]
+unset MOCK_HANG_DOCKER DOCKER_TIMEOUT
+export SPACE_SCAN_TIMEOUT=1 MOCK_HANG_SCAN=1
+expect_failure bash "$TEST_ROOT/host/scripts/export.sh"
+grep -q 'Estimating /app/data size' "$TEST_ROOT/failure.log"
+grep -q 'Size scan failed or timed out for /app/data' "$TEST_ROOT/failure.log"
+[[ ! -e "$MOCK_LOG.helper-active" && "$(cat "$MOCK_APP_STATE")" == true ]]
+! grep -q 'docker stop' "$MOCK_LOG"
+unset MOCK_HANG_SCAN SPACE_SCAN_TIMEOUT
+export MOCK_FAIL_SCAN=1
+expect_failure bash "$TEST_ROOT/host/scripts/export.sh"
+[[ ! -e "$MOCK_LOG.helper-active" ]]
+unset MOCK_FAIL_SCAN
+printf 'PASS: stalled Docker checks and mount scans fail visibly before stopping the source\n'
+
+# A failed or interrupted archive must clean up its helper and restart the app,
+# even in cutover mode. Cleanup failure must not skip the restart.
+export LEAVE_GRIMMORY_STOPPED=1 MOCK_FAIL_ARCHIVE=1 MIGRATION_ID=grimmory-archive-failure
+expect_failure bash "$TEST_ROOT/host/scripts/export.sh"
+[[ ! -e "$MOCK_LOG.helper-active" && "$(cat "$MOCK_APP_STATE")" == true ]]
+[[ ! -f "$REMOTE_ROOT/$MIGRATION_ID/SHA256SUMS" ]]
+export MOCK_FAIL_HELPER_CLEANUP=1 MIGRATION_ID=grimmory-cleanup-failure
+expect_failure bash "$TEST_ROOT/host/scripts/export.sh"
+[[ "$(cat "$MOCK_APP_STATE")" == true ]]
+grep -q 'Could not remove backup helper' "$TEST_ROOT/failure.log"
+rm -f -- "$MOCK_LOG.helper-active"
+unset MOCK_FAIL_ARCHIVE MOCK_FAIL_HELPER_CLEANUP
+for signal in INT TERM; do
+  export MOCK_SIGNAL_EXPORT="$signal" MIGRATION_ID="grimmory-interrupted-$signal"
+  expect_failure bash "$TEST_ROOT/host/scripts/export.sh"
+  [[ ! -e "$MOCK_LOG.helper-active" && "$(cat "$MOCK_APP_STATE")" == true ]]
+  [[ ! -f "$REMOTE_ROOT/$MIGRATION_ID/SHA256SUMS" ]]
+  grep -q 'cleaning up' "$TEST_ROOT/failure.log"
+done
+unset MOCK_SIGNAL_EXPORT MIGRATION_ID LEAVE_GRIMMORY_STOPPED APP_CONTAINER
+while IFS= read -r cidfile; do [[ ! -e "$cidfile" && ! -d "${cidfile%/*}" ]]; done < "$MOCK_LOG.cidfiles"
+assert_configs_cleaned
+printf 'PASS: archive errors and interrupts remove helpers and restore the source, including after cleanup failure\n'
 
 # Import must block every failure before any destination restore operation.
 printf 'false\n' > "$MOCK_APP_STATE"

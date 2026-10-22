@@ -22,17 +22,35 @@ DB_USER="${DB_USER:-grimmory}"
 IMAGE="${UTILITY_IMAGE:-alpine:3.20}"
 BACKUP_DIR="${GRIMMORY_TRANSFER_WORKDIR:-${BACKUP_DIR:-/var/tmp/grimmory-transfer}}"
 ARTIFACTS=(database.sql app-data.tar.gz books.tar.gz bookdrop.tar.gz manifest.txt)
+# Only short Docker operations use this limit; archives and SQL dumps can be large.
+docker_check() {
+  local rc
+  if timeout --kill-after=5 "${DOCKER_TIMEOUT}s" docker "$@"; then
+    return 0
+  else
+    rc=$?
+  fi
+  if [[ "$rc" == 124 || "$rc" == 137 ]]; then
+    echo "ERROR: Docker $1 timed out after ${DOCKER_TIMEOUT}s; check the Docker daemon and its storage." >&2
+  fi
+  return "$rc"
+}
 preflight() {
-  require docker; require sha256sum
-  docker inspect "$APP_CONTAINER" >/dev/null || die "App container not found: $APP_CONTAINER"
-  docker inspect "$DB_CONTAINER" >/dev/null || die "Database container not found: $DB_CONTAINER"
+  require docker; require sha256sum; require timeout
+  DOCKER_TIMEOUT="${DOCKER_TIMEOUT:-30}"
+  [[ "$DOCKER_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die 'DOCKER_TIMEOUT must be a positive integer (seconds)'
+  echo "Checking Docker access to app container: $APP_CONTAINER (timeout ${DOCKER_TIMEOUT}s)..." >&2
+  docker_check inspect "$APP_CONTAINER" >/dev/null || die "Cannot inspect app container: $APP_CONTAINER"
+  echo "Checking database container: $DB_CONTAINER..." >&2
+  docker_check inspect "$DB_CONTAINER" >/dev/null || die "Cannot inspect database container: $DB_CONTAINER"
   [[ -n "${DB_PASSWORD:-}" ]] || die "Set DB_PASSWORD in the private transfer configuration (chmod 600)"
 }
-state() { docker inspect --format '{{.State.Running}}' "$1"; }
+state() { docker_check inspect --format '{{.State.Running}}' "$1"; }
 mount_exists() {
-  docker inspect --format '{{range .Mounts}}{{println .Destination}}{{end}}' "$APP_CONTAINER" | grep -Fxq "$1"
+  docker_check inspect --format '{{range .Mounts}}{{println .Destination}}{{end}}' "$APP_CONTAINER" | grep -Fxq "$1"
 }
 assert_mounts() {
+  echo 'Checking required Docker mounts...' >&2
   for path in /app/data /books /bookdrop; do
     mount_exists "$path" || die "Missing separate Docker mount at $path in $APP_CONTAINER. Adjust your Compose mounts first."
   done

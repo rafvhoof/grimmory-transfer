@@ -2,6 +2,11 @@
 set -Eeuo pipefail
 printf 'docker %s\n' "$*" >> "$MOCK_LOG"
 command="$1"; shift
+if [[ "${MOCK_HANG_DOCKER:-}" == "$command" ]]; then
+  # Emulate a wedged Docker client that does not stop on the first TERM.
+  trap '' TERM
+  exec sleep 60
+fi
 case "$command" in
   inspect)
     [[ "${1:-}" == --format ]] || exit 0
@@ -20,12 +25,40 @@ case "$command" in
     ;;
   stop) printf 'false\n' > "$MOCK_APP_STATE" ;;
   start) printf 'true\n' > "$MOCK_APP_STATE" ;;
+  rm)
+    [[ "$1" == -f && "$2" == bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ]]
+    [[ "${MOCK_FAIL_HELPER_CLEANUP:-0}" == 0 ]] || exit 35
+    rm -f -- "$MOCK_LOG.helper-active"
+    ;;
   run)
+    cidfile=''
+    args=("$@")
+    for ((i=0; i<${#args[@]}; i++)); do
+      if [[ "${args[i]}" == --cidfile ]]; then
+        cidfile="${args[i+1]}"
+        [[ ! -e "$cidfile" ]]
+        printf '%s\n' "$cidfile" >> "$MOCK_LOG.cidfiles"
+        printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb > "$cidfile"
+        : > "$MOCK_LOG.helper-active"
+        [[ " $* " == *' --init '* ]]
+        break
+      fi
+    done
     if [[ " $* " == *' du -sk '* ]]; then
-      printf '1 /app/data\n1 /books\n1 /bookdrop\n'
+      if [[ "${MOCK_HANG_SCAN:-0}" == 1 ]]; then
+        trap '' TERM
+        exec sleep 60
+      fi
+      [[ "${MOCK_FAIL_SCAN:-0}" == 0 ]] || exit 36
+      printf '1 %s\n' "${@: -1}"
     elif [[ " $* " == *' sh -c '* ]]; then
       [[ "${MOCK_NONEMPTY_MOUNT:-0}" == 0 ]]
     elif [[ " $* " == *' -czf '* ]]; then
+      [[ "${MOCK_FAIL_ARCHIVE:-0}" == 0 ]] || exit 37
+      if [[ -n "${MOCK_SIGNAL_EXPORT:-}" ]]; then
+        kill -s "$MOCK_SIGNAL_EXPORT" "$PPID"
+        exit 130
+      fi
       directory='' archive=''
       while (( $# > 0 )); do
         case "$1" in
@@ -39,6 +72,9 @@ case "$command" in
       printf 'RESTORE mount\n' >> "$MOCK_WRITES"
     else
       exit 31
+    fi
+    if [[ -n "$cidfile" ]]; then
+      rm -f -- "$cidfile" "$MOCK_LOG.helper-active"
     fi
     ;;
   exec)
