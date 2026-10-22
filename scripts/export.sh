@@ -1,20 +1,55 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 source "$(dirname "$0")/common.sh"
+source "$ROOT/scripts/nextcloud.sh"
+APP_STOPPED=0
+SUCCESS=0
+# Preserve the existing restart behavior; final-cutover mode is explicitly opt-in.
+LEAVE_GRIMMORY_STOPPED="${LEAVE_GRIMMORY_STOPPED:-0}"
+cleanup() {
+  local rc=$?
+  nextcloud_cleanup
+  if (( APP_STOPPED == 1 )) && { (( SUCCESS == 0 )) || [[ "$LEAVE_GRIMMORY_STOPPED" == 0 ]]; }; then
+    echo 'Restoring source Grimmory container...'
+    docker start "$APP_CONTAINER" >/dev/null || rc=1
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+[[ $# -le 1 ]] || die 'Usage: scripts/export.sh [/path/to/new-backup-directory]'
+[[ "$LEAVE_GRIMMORY_STOPPED" == 0 || "$LEAVE_GRIMMORY_STOPPED" == 1 ]] || die 'LEAVE_GRIMMORY_STOPPED must be 0 or 1'
 preflight
 assert_mounts
-[[ "$(state "$DB_CONTAINER")" == true ]] || die "Database must be running"
-[[ "$(state "$APP_CONTAINER")" == true ]] || die "Application must be running when starting export"
-require tar
-mkdir -p "$BACKUP_DIR"
-OUTPUT="${1:-$BACKUP_DIR/grimmory-$(date -u +%Y%m%dT%H%M%SZ)}"
-[[ ! -e "$OUTPUT" ]] || die "Destination exists: $OUTPUT"
-mkdir -m 700 "$OUTPUT"
-resume() { if [[ "${APP_STOPPED:-0}" == 1 ]]; then docker start "$APP_CONTAINER" >/dev/null || true; fi; }
-trap resume EXIT
+[[ "$(state "$DB_CONTAINER")" == true ]] || die 'Database must be running'
+[[ "$(state "$APP_CONTAINER")" == true ]] || die 'Application must be running when starting export'
+require tar; require awk; require df
+MIGRATION_ID="${MIGRATION_ID:-grimmory-$(date -u +%Y%m%dT%H%M%SZ)}"
+validate_migration_id "$MIGRATION_ID"
+OUTPUT="${1:-$BACKUP_DIR/$MIGRATION_ID}"
+[[ ! -e "$OUTPUT" && ! -L "$OUTPUT" ]] || die "Destination exists: $OUTPUT"
+mkdir -p -- "$(dirname "$OUTPUT")"
+OUTPUT="$(cd "$(dirname "$OUTPUT")" && pwd)/$(basename "$OUTPUT")"
+
+# Estimate an uncompressed staging copy plus DB size, margin and fixed overhead.
+SPACE_MARGIN_PERCENT="${SPACE_MARGIN_PERCENT:-25}"
+SPACE_MARGIN_BYTES="${SPACE_MARGIN_BYTES:-536870912}"
+[[ "$SPACE_MARGIN_PERCENT" =~ ^[0-9]+$ && "$SPACE_MARGIN_BYTES" =~ ^[0-9]+$ ]] || die 'Space margins must be nonnegative integers'
+MOUNT_KIB="$(docker run --rm --volumes-from "$APP_CONTAINER":ro "$IMAGE" du -sk /app/data /books /bookdrop | awk '{total += $1} END {printf "%.0f", total}')"
+DB_BYTES="$(docker exec -e MYSQL_PWD="$DB_PASSWORD" "$DB_CONTAINER" mariadb --batch --skip-column-names \
+  --user="$DB_USER" --database="$DB_NAME" --execute='SELECT COALESCE(SUM(data_length + index_length), 0) FROM information_schema.tables WHERE table_schema = DATABASE();')"
+AVAILABLE_KIB="$(df -Pk "$(dirname "$OUTPUT")" | awk 'NR==2 {print $4}')"
+[[ "$MOUNT_KIB" =~ ^[0-9]+$ && "$DB_BYTES" =~ ^[0-9]+$ && "$AVAILABLE_KIB" =~ ^[0-9]+$ ]] || die 'Cannot estimate staging space'
+REQUIRED_BYTES=$(( (MOUNT_KIB * 1024 + DB_BYTES) * (100 + SPACE_MARGIN_PERCENT) / 100 + SPACE_MARGIN_BYTES ))
+echo "Estimated staging requirement: $REQUIRED_BYTES bytes; available: $((AVAILABLE_KIB * 1024)) bytes"
+(( AVAILABLE_KIB * 1024 >= REQUIRED_BYTES )) || die 'Not enough staging space; set GRIMMORY_TRANSFER_WORKDIR to a larger filesystem'
+
+nextcloud_init
+nextcloud_preflight
+mkdir -m 700 -- "$OUTPUT"
+create_remote_pending_marker "$MIGRATION_ID"
 printf 'Stopping app to prevent writes during backup...\n'
-docker stop "$APP_CONTAINER" >/dev/null
 APP_STOPPED=1
+docker stop "$APP_CONTAINER" >/dev/null
 printf 'Dumping MariaDB...\n'
 docker exec -e MYSQL_PWD="$DB_PASSWORD" "$DB_CONTAINER" mariadb-dump \
   --user="$DB_USER" --single-transaction --quick --routines --events --triggers \
@@ -30,12 +65,18 @@ cat > "$OUTPUT/manifest.txt" <<MANIFEST
 format=grimmory-transfer-v1
 created_utc=$(date -u +%FT%TZ)
 source_app_image=$(docker inspect --format '{{.Config.Image}}' "$APP_CONTAINER")
+source_app_image_id=$(docker inspect --format '{{.Image}}' "$APP_CONTAINER")
 source_db_image=$(docker inspect --format '{{.Config.Image}}' "$DB_CONTAINER")
 db_name=$DB_NAME
 source_container=$APP_CONTAINER
 mounts=/app/data,/books,/bookdrop
 MANIFEST
-(cd "$OUTPUT" && sha256sum database.sql app-data.tar.gz books.tar.gz bookdrop.tar.gz manifest.txt > SHA256SUMS)
-sha_check "$OUTPUT"
-echo "Export completed: $OUTPUT"
-echo 'Keep this backup encrypted and off GitHub: it may contain books, account data, and credentials.'
+(cd "$OUTPUT" && sha256sum "${ARTIFACTS[@]}" > SHA256SUMS)
+upload_bundle "$OUTPUT" "$MIGRATION_ID"
+SUCCESS=1
+echo "Export completed. Migration ID: $MIGRATION_ID"
+echo "Local staging copy: $OUTPUT"
+if [[ "$LEAVE_GRIMMORY_STOPPED" == 1 ]]; then
+  echo 'Source Grimmory is left stopped to prevent changes after the final export.'
+fi
+echo 'Retain the source VM and private migration copies until the new VM is validated.'

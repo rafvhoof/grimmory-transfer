@@ -1,0 +1,5 @@
+# Migration scripts run on Linux, including after a Windows checkout.
+*.sh text eol=lf
+tests/helpers/* text eol=lf
+*.env.example text eol=lf
+.env.example text eol=lf

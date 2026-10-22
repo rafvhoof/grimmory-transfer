@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ " $* " != *'app password $with!characters'* ]]
+if [[ "$1" == obscure ]]; then
+  [[ "$#" == 2 && "$2" == - ]]
+  IFS= read -r password
+  [[ "$password" == 'app password $with!characters' ]]
+  printf 'obscured-test-password\n'
+  exit
+fi
+config=''
+while [[ "$1" == --* ]]; do
+  case "$1" in
+    --config) config="$2"; shift 2 ;;
+    --contimeout|--timeout|--retries|--low-level-retries) shift 2 ;;
+    *) exit 20 ;;
+  esac
+done
+[[ -f "$config" ]]
+grep -Fxq 'url = https://cloud.example.com/nextcloud/remote.php/dav/files/user%40example.com/' "$config"
+grep -Fxq 'vendor = nextcloud' "$config"
+grep -Fxq 'user = user@example.com' "$config"
+grep -Fxq 'pass = obscured-test-password' "$config"
+printf '%s\n' "$config" >> "$MOCK_CONFIGS"
+command="$1"; shift
+printf 'rclone %s %s\n' "$command" "$*" >> "$MOCK_LOG"
+[[ "${MOCK_FAIL_COMMAND:-}" != "$command" ]] || exit 21
+translate() { printf '%s' "${1/nc:/$MOCK_REMOTE/}"; }
+copy_one() {
+  [[ "${MOCK_FAIL_FILE:-}" != "${1##*/}" ]] || return 22
+  [[ -f "$1" ]] || return 23
+  if [[ "$immutable" == 1 && -f "$2" ]]; then
+    cmp -s "$1" "$2" || return 24
+  fi
+  mkdir -p "$(dirname "$2")"
+  cp "$1" "$2"
+  if [[ "${MOCK_CORRUPT_FILE:-}" == "${1##*/}" ]]; then
+    printf 'corruption\n' >> "$2"
+  fi
+}
+immutable=0
+case "$command" in
+  mkdir) mkdir -p "$(translate "$1")" ;;
+  rmdir) rmdir "$(translate "$1")" ;;
+  deletefile) rm -f -- "$(translate "$1")" ;;
+  lsf)
+    directory="$(translate "$1")"
+    [[ -d "$directory" ]] || exit 25
+    for path in "$directory"/*; do
+      [[ -e "$path" ]] || continue
+      if [[ " $* " == *' --dirs-only '* ]]; then
+        [[ ! -d "$path" ]] || printf '%s/\n' "${path##*/}"
+      elif [[ -f "$path" ]]; then
+        printf '%s\n' "${path##*/}"
+      fi
+    done
+    ;;
+  copyto|copy)
+    source_path="$(translate "$1")" destination_path="$(translate "$2")"
+    shift 2
+    [[ " $* " != *' --immutable '* ]] || immutable=1
+    if [[ "$command" == copyto ]]; then
+      copy_one "$source_path" "$destination_path"
+    else
+      includes=()
+      while (( $# > 0 )); do
+        if [[ "$1" == --include ]]; then includes+=("${2#/}"); shift 2; else shift; fi
+      done
+      [[ "${#includes[@]}" == 5 ]]
+      for file in "${includes[@]}"; do
+        copy_one "${source_path%/}/$file" "${destination_path%/}/$file"
+      done
+    fi
+    ;;
+  *) exit 26 ;;
+esac

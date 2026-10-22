@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# Offline integration tests: real files/checksums; fake Docker and rclone transports.
+set -Eeuo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/grimmory-transfer-test.XXXXXX")"
+cleanup() {
+  [[ "$TEST_ROOT" == "${TMPDIR:-/tmp}"/grimmory-transfer-test.* ]] || exit 1
+  rm -rf -- "$TEST_ROOT"
+}
+trap cleanup EXIT
+mkdir -p "$TEST_ROOT/host/scripts" "$TEST_ROOT/bin" "$TEST_ROOT/remote" "$TEST_ROOT/source backup" "$TEST_ROOT/content"
+cp "$ROOT/scripts/"*.sh "$TEST_ROOT/host/scripts/"
+cp "$ROOT/tests/helpers/"* "$TEST_ROOT/bin/"
+chmod +x "$TEST_ROOT/bin/"*
+export MOCK_REAL_DF="$(command -v df)"
+export PATH="$TEST_ROOT/bin:$PATH"
+export MOCK_REMOTE="$TEST_ROOT/remote" MOCK_LOG="$TEST_ROOT/commands.log"
+export MOCK_CONFIGS="$TEST_ROOT/configs.log" MOCK_WRITES="$TEST_ROOT/writes.log"
+export MOCK_CONTENT="$TEST_ROOT/content" MOCK_APP_STATE="$TEST_ROOT/app-state"
+export TRANSFER_ENV_FILE="$TEST_ROOT/transfer.env" BACKUP_DIR="$TEST_ROOT/downloads"
+cat > "$TRANSFER_ENV_FILE" <<'CONFIG'
+NC_URL='https://cloud.example.com/nextcloud'
+NC_USER='user@example.com'
+NC_APP_PASSWORD='app password $with!characters'
+NC_REMOTE_ROOT='Migration backups/Grimmory'
+AUTO_INSTALL_RCLONE=0
+DB_PASSWORD='test-database-password'
+CONFIG
+REMOTE_ROOT="$MOCK_REMOTE/Migration backups/Grimmory"
+printf 'true\n' > "$MOCK_APP_STATE"
+printf 'Book content\n' > "$MOCK_CONTENT/book.txt"
+ARTIFACTS=(database.sql app-data.tar.gz books.tar.gz bookdrop.tar.gz manifest.txt)
+SOURCE="$TEST_ROOT/source backup"
+printf 'SELECT 1;\n' > "$SOURCE/database.sql"
+printf 'format=grimmory-transfer-v1\nsource_app_image=ghcr.io/grimmory/grimmory:1.0.0\nsource_app_image_id=sha256:test-image\n' > "$SOURCE/manifest.txt"
+for file in app-data.tar.gz books.tar.gz bookdrop.tar.gz; do
+  tar -czf "$SOURCE/$file" -C "$MOCK_CONTENT" .
+done
+checksums() { (cd "$SOURCE" && sha256sum "${ARTIFACTS[@]}" > SHA256SUMS); }
+checksums
+printf 'private secret\n' > "$SOURCE/.env"
+transfer() { bash "$TEST_ROOT/host/scripts/transfer.sh" "$@"; }
+expect_failure() {
+  if "$@" > "$TEST_ROOT/failure.log" 2>&1; then
+    echo "Expected failure: $*" >&2
+    exit 1
+  fi
+}
+assert_no_writes() { [[ ! -s "$MOCK_WRITES" ]]; }
+assert_configs_cleaned() {
+  while IFS= read -r config; do [[ ! -e "$config" && ! -d "${config%/*}" ]]; done < "$MOCK_CONFIGS"
+}
+
+transfer preflight > /dev/null
+[[ "$(cat "$MOCK_APP_STATE")" == true ]]
+transfer upload "$SOURCE" grimmory-20261021T120000Z > /dev/null
+REMOTE="$REMOTE_ROOT/grimmory-20261021T120000Z"
+[[ ! -e "$REMOTE/.env" && ! -e "$REMOTE/UPLOAD-PENDING.txt" && -f "$REMOTE/SHA256SUMS" ]]
+transfer download grimmory-20261021T120000Z "$TEST_ROOT/target backup" > /dev/null
+for file in "${ARTIFACTS[@]}" SHA256SUMS; do cmp "$SOURCE/$file" "$TEST_ROOT/target backup/$file"; done
+assert_configs_cleaned
+printf 'PASS: preflight, round trip, private-file filtering and temporary credential cleanup\n'
+
+transfer upload "$SOURCE" grimmory-20261021T120000Z > /dev/null
+printf 'SELECT 2;\n' > "$SOURCE/database.sql"
+checksums
+expect_failure transfer upload "$SOURCE" grimmory-20261021T120000Z
+printf 'SELECT 1;\n' > "$SOURCE/database.sql"
+checksums
+printf 'PASS: identical uploads can be retried; changed remote artifacts are rejected\n'
+
+export MOCK_FAIL_FILE=books.tar.gz
+expect_failure transfer upload "$SOURCE" grimmory-20261022T120000Z
+[[ -f "$REMOTE_ROOT/grimmory-20261022T120000Z/UPLOAD-PENDING.txt" && ! -e "$REMOTE_ROOT/grimmory-20261022T120000Z/SHA256SUMS" ]]
+unset MOCK_FAIL_FILE
+expect_failure transfer download grimmory-20261022T120000Z
+transfer download > /dev/null
+[[ -f "$BACKUP_DIR/grimmory-20261021T120000Z/database.sql" ]]
+transfer upload "$SOURCE" grimmory-20261022T120000Z > /dev/null
+transfer download > /dev/null
+[[ -f "$BACKUP_DIR/grimmory-20261022T120000Z/database.sql" ]]
+printf 'PASS: pending uploads are blocked and latest selection chooses completed bundles\n'
+
+export MOCK_CORRUPT_FILE=database.sql
+expect_failure transfer download grimmory-20261021T120000Z "$TEST_ROOT/corrupt backup"
+grep -q 'database.sql: FAILED' "$TEST_ROOT/failure.log"
+unset MOCK_CORRUPT_FILE
+transfer download grimmory-20261021T120000Z "$TEST_ROOT/corrupt backup" > /dev/null
+printf 'PASS: downloaded corruption is detected and a retry repairs the backup\n'
+
+printf 'broken backup\n' >> "$SOURCE/database.sql"
+expect_failure transfer upload "$SOURCE" grimmory-corrupt
+[[ ! -e "$REMOTE_ROOT/grimmory-corrupt" ]]
+printf 'SELECT 1;\n' > "$SOURCE/database.sql"
+sed '/database.sql$/d' "$SOURCE/SHA256SUMS" > "$TEST_ROOT/incomplete-sums"
+cp "$TEST_ROOT/incomplete-sums" "$SOURCE/SHA256SUMS"
+expect_failure transfer upload "$SOURCE" grimmory-missing-checksum
+checksums
+printf 'PASS: corrupt sources and incomplete checksum manifests cannot be uploaded\n'
+
+expect_failure transfer download ../escape
+sed 's#^NC_REMOTE_ROOT=.*#NC_REMOTE_ROOT=../escape#' "$TRANSFER_ENV_FILE" > "$TEST_ROOT/invalid.env"
+expect_failure env TRANSFER_ENV_FILE="$TEST_ROOT/invalid.env" bash "$TEST_ROOT/host/scripts/transfer.sh" download grimmory-20261021T120000Z
+sed 's#^NC_URL=.*#NC_URL=http://cloud.example.com#' "$TRANSFER_ENV_FILE" > "$TEST_ROOT/invalid.env"
+expect_failure env TRANSFER_ENV_FILE="$TEST_ROOT/invalid.env" bash "$TEST_ROOT/host/scripts/transfer.sh" preflight
+expect_failure env TRANSFER_ENV_FILE="$TEST_ROOT/nonexistent.env" bash "$TEST_ROOT/host/scripts/transfer.sh" preflight
+expect_failure transfer invalid
+assert_configs_cleaned
+printf 'PASS: invalid migration paths, missing configuration and invalid commands fail safely\n'
+
+# Export exercises source stop/restart and failures without contacting Docker.
+export MIGRATION_ID=grimmory-20261022T130000Z
+bash "$TEST_ROOT/host/scripts/export.sh" > /dev/null
+[[ "$(cat "$MOCK_APP_STATE")" == true && -f "$REMOTE_ROOT/$MIGRATION_ID/SHA256SUMS" ]]
+export MIGRATION_ID=grimmory-20261022T140000Z LEAVE_GRIMMORY_STOPPED=1
+bash "$TEST_ROOT/host/scripts/export.sh" > /dev/null
+[[ "$(cat "$MOCK_APP_STATE")" == false ]]
+printf 'true\n' > "$MOCK_APP_STATE"
+export MIGRATION_ID=grimmory-20261022T150000Z MOCK_FAIL_DUMP=1
+expect_failure bash "$TEST_ROOT/host/scripts/export.sh"
+[[ "$(cat "$MOCK_APP_STATE")" == true && -f "$REMOTE_ROOT/$MIGRATION_ID/UPLOAD-PENDING.txt" ]]
+unset MOCK_FAIL_DUMP
+export MIGRATION_ID=grimmory-20261022T160000Z MOCK_FAIL_FILE=books.tar.gz
+expect_failure bash "$TEST_ROOT/host/scripts/export.sh"
+[[ "$(cat "$MOCK_APP_STATE")" == true && ! -e "$REMOTE_ROOT/$MIGRATION_ID/SHA256SUMS" ]]
+unset MOCK_FAIL_FILE LEAVE_GRIMMORY_STOPPED
+export MIGRATION_ID=grimmory-20261022T170000Z MOCK_FAIL_COMMAND=mkdir
+: > "$MOCK_LOG"
+expect_failure bash "$TEST_ROOT/host/scripts/export.sh"
+! grep -q 'docker stop' "$MOCK_LOG"
+[[ "$(cat "$MOCK_APP_STATE")" == true ]]
+unset MOCK_FAIL_COMMAND MIGRATION_ID
+export MOCK_NO_SPACE=1
+: > "$MOCK_LOG"
+expect_failure bash "$TEST_ROOT/host/scripts/export.sh"
+! grep -q 'docker stop' "$MOCK_LOG"
+unset MOCK_NO_SPACE
+assert_configs_cleaned
+printf 'PASS: integrated export uploads, restarts by default, supports cutover and recovers from failures\n'
+
+# Import must block every failure before any destination restore operation.
+printf 'false\n' > "$MOCK_APP_STATE"
+expect_failure env -u CONFIRM_REPLACE bash "$TEST_ROOT/host/scripts/import.sh" "$SOURCE"
+assert_no_writes
+export CONFIRM_REPLACE=YES MOCK_IMAGE=ghcr.io/grimmory/grimmory:2.0.0
+expect_failure bash "$TEST_ROOT/host/scripts/import.sh" "$SOURCE"
+grep -q 'Image mismatch' "$TEST_ROOT/failure.log"
+assert_no_writes
+unset MOCK_IMAGE
+export MOCK_IMAGE_ID=sha256:different-image
+expect_failure bash "$TEST_ROOT/host/scripts/import.sh" "$SOURCE"
+assert_no_writes
+unset MOCK_IMAGE_ID
+export MOCK_TABLES=1
+expect_failure bash "$TEST_ROOT/host/scripts/import.sh" "$SOURCE"
+assert_no_writes
+unset MOCK_TABLES
+export MOCK_NONEMPTY_MOUNT=1
+expect_failure bash "$TEST_ROOT/host/scripts/import.sh" "$SOURCE"
+assert_no_writes
+unset MOCK_NONEMPTY_MOUNT
+export MOCK_CORRUPT_FILE=database.sql
+expect_failure bash "$TEST_ROOT/host/scripts/import.sh"
+assert_no_writes
+unset MOCK_CORRUPT_FILE
+bash "$TEST_ROOT/host/scripts/import.sh" > /dev/null
+[[ "$(wc -l < "$MOCK_WRITES")" -eq 4 && "$(cat "$MOCK_APP_STATE")" == false ]]
+assert_configs_cleaned
+printf 'PASS: integrated import verifies images, checks empty targets and restores only verified data\n'
+: > "$MOCK_LOG"
+bash "$TEST_ROOT/host/scripts/import.sh" "$SOURCE" > /dev/null
+! grep -q '^rclone ' "$MOCK_LOG"
+printf 'PASS: importing an existing local bundle does not require Nextcloud\n'

@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'docker %s\n' "$*" >> "$MOCK_LOG"
+command="$1"; shift
+case "$command" in
+  inspect)
+    [[ "${1:-}" == --format ]] || exit 0
+    case "$2" in
+      *'.State.Running'*)
+        if [[ "$3" == mariadb ]]; then echo true; else cat "$MOCK_APP_STATE"; fi ;;
+      *'.Config.Image'*) echo "${MOCK_IMAGE:-ghcr.io/grimmory/grimmory:1.0.0}" ;;
+      *'{{.Image}}'*) echo "${MOCK_IMAGE_ID:-sha256:test-image}" ;;
+      *'.Mounts'*) printf '/app/data\n/books\n/bookdrop\n' ;;
+      *) exit 30 ;;
+    esac
+    ;;
+  stop) printf 'false\n' > "$MOCK_APP_STATE" ;;
+  start) printf 'true\n' > "$MOCK_APP_STATE" ;;
+  run)
+    if [[ " $* " == *' du -sk '* ]]; then
+      printf '1 /app/data\n1 /books\n1 /bookdrop\n'
+    elif [[ " $* " == *' sh -c '* ]]; then
+      [[ "${MOCK_NONEMPTY_MOUNT:-0}" == 0 ]]
+    elif [[ " $* " == *' -czf '* ]]; then
+      directory='' archive=''
+      while (( $# > 0 )); do
+        case "$1" in
+          -v) directory="${2%:/backup}"; shift 2 ;;
+          /backup/*) archive="${1#/backup/}"; shift ;;
+          *) shift ;;
+        esac
+      done
+      tar -czf "$directory/$archive" -C "$MOCK_CONTENT" .
+    elif [[ " $* " == *' -xzf '* ]]; then
+      printf 'RESTORE mount\n' >> "$MOCK_WRITES"
+    else
+      exit 31
+    fi
+    ;;
+  exec)
+    if [[ " $* " == *' mariadb-dump '* ]]; then
+      [[ "${MOCK_FAIL_DUMP:-0}" == 0 ]] || exit 32
+      printf 'SELECT 1;\n'
+    elif [[ " $* " == *'SHOW TABLES;'* ]]; then
+      [[ "${MOCK_TABLES:-0}" == 0 ]] || printf 'existing_table\n'
+    elif [[ " $* " == *'information_schema.tables'* ]]; then
+      printf '0\n'
+    elif [[ " $* " == *' -i '* ]]; then
+      cat >/dev/null
+      printf 'RESTORE database\n' >> "$MOCK_WRITES"
+    else
+      exit 33
+    fi
+    ;;
+  *) exit 34 ;;
+esac

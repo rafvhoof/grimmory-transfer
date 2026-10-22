@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ "${MOCK_NO_SPACE:-0}" == 1 ]]; then
+  printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/mock 1 1 0 100%% /tmp\n'
+else
+  exec "$MOCK_REAL_DF" "$@"
+fi

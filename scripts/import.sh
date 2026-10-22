@@ -1,18 +1,31 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 source "$(dirname "$0")/common.sh"
+source "$ROOT/scripts/nextcloud.sh"
+trap nextcloud_cleanup EXIT
+[[ $# -le 1 ]] || die 'Usage: scripts/import.sh [/path/to/local-backup-directory] (without a path, download from Nextcloud)'
 preflight
 assert_mounts
-[[ $# -eq 1 ]] || die "Usage: scripts/import.sh /path/to/grimmory-backup-directory"
-SOURCE="$(cd "$1" && pwd)"
 [[ "$(state "$DB_CONTAINER")" == true ]] || die 'Start only destination MariaDB first'
 [[ "$(state "$APP_CONTAINER")" == false ]] || die 'Stop destination Grimmory first (docker compose stop grimmory)'
 [[ "${CONFIRM_REPLACE:-}" == 'YES' ]] || die 'Explicit approval required: set CONFIRM_REPLACE=YES after reading README and making a destination backup'
-for file in database.sql app-data.tar.gz books.tar.gz bookdrop.tar.gz manifest.txt SHA256SUMS; do
-  [[ -f "$SOURCE/$file" ]] || die "Missing $file"
-done
-sha_check "$SOURCE"
-grep -Fxq 'format=grimmory-transfer-v1' "$SOURCE/manifest.txt" || die 'Unsupported backup format'
+if [[ $# -eq 1 ]]; then
+  SOURCE="$(cd "$1" && pwd)"
+else
+  nextcloud_init
+  MIGRATION_ID="$(resolve_migration_id)"
+  SOURCE="$BACKUP_DIR/$MIGRATION_ID"
+  download_bundle "$MIGRATION_ID" "$SOURCE"
+  SOURCE="$(cd "$SOURCE" && pwd)"
+fi
+verify_bundle "$SOURCE"
+SOURCE_IMAGE="$(metadata_value "$SOURCE" source_app_image)"
+TARGET_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$APP_CONTAINER")"
+[[ -n "$SOURCE_IMAGE" && "$SOURCE_IMAGE" == "$TARGET_IMAGE" ]] || die "Image mismatch: source is $SOURCE_IMAGE; target is $TARGET_IMAGE. Pin the same Grimmory image before importing."
+SOURCE_IMAGE_ID="$(metadata_value "$SOURCE" source_app_image_id)"
+if [[ -n "$SOURCE_IMAGE_ID" ]]; then
+  [[ "$SOURCE_IMAGE_ID" == "$(docker inspect --format '{{.Image}}' "$APP_CONTAINER")" ]] || die 'Grimmory image contents differ despite matching tags; pin the same image digest before importing'
+fi
 # Fail closed if app volumes are not empty. Intentional destructive replacement must be performed manually.
 for path in /app/data /books /bookdrop; do
   docker run --rm --volumes-from "$APP_CONTAINER":ro "$IMAGE" sh -c \
