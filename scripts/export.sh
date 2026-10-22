@@ -15,7 +15,8 @@ cleanup() {
   if [[ -n "$EXPORT_STATE_DIR" ]]; then
     # The CID file also survives command substitutions used for size estimates.
     if [[ -s "$EXPORT_STATE_DIR/container.cid" ]]; then
-      container_id="$(cat "$EXPORT_STATE_DIR/container.cid")"
+      # Docker --rm may remove the CID file while cleanup is reading it.
+      container_id="$(cat "$EXPORT_STATE_DIR/container.cid" 2>/dev/null)" || container_id=''
       if [[ "$container_id" =~ ^[a-f0-9]{64}$ ]]; then
         echo "Removing backup helper container: $container_id" >&2
         docker_check rm -f "$container_id" >/dev/null || {

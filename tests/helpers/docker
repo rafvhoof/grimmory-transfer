@@ -15,7 +15,11 @@ case "$command" in
         if [[ "$3" == mariadb || "$3" == grimmory-db ]]; then echo true; else cat "$MOCK_APP_STATE"; fi ;;
       *'.Config.Image'*) echo "${MOCK_IMAGE:-ghcr.io/grimmory/grimmory:1.0.0}" ;;
       *'{{.Image}}'*) echo "${MOCK_IMAGE_ID:-sha256:test-image}" ;;
-      *'.Mounts'*) printf '/app/data\n/books\n/bookdrop\n' ;;
+      *'.Mounts'*)
+        printf '/app/data\n'
+        if [[ "${MOCK_STREAM_MOUNTS:-0}" == 1 ]]; then sleep 0.1; fi
+        printf '/books\n/bookdrop\n'
+        ;;
       *) exit 30 ;;
     esac
     ;;

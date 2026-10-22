@@ -47,7 +47,8 @@ preflight() {
 }
 state() { docker_check inspect --format '{{.State.Running}}' "$1"; }
 mount_exists() {
-  docker_check inspect --format '{{range .Mounts}}{{println .Destination}}{{end}}' "$APP_CONTAINER" | grep -Fxq "$1"
+  # Drain Docker's output: grep -q can close the pipe early and cause SIGPIPE.
+  docker_check inspect --format '{{range .Mounts}}{{println .Destination}}{{end}}' "$APP_CONTAINER" | grep -Fx "$1" >/dev/null
 }
 assert_mounts() {
   echo 'Checking required Docker mounts...' >&2

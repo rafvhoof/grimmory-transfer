@@ -116,7 +116,7 @@ assert_configs_cleaned
 printf 'PASS: invalid migration paths, missing configuration and invalid commands fail safely\n'
 
 # Export exercises source stop/restart and failures without contacting Docker.
-export APP_CONTAINER=booklore
+export APP_CONTAINER=booklore MOCK_STREAM_MOUNTS=1
 export MIGRATION_ID=grimmory-20261022T130000Z
 bash "$TEST_ROOT/host/scripts/export.sh" > /dev/null
 [[ "$(cat "$MOCK_APP_STATE")" == true && -f "$REMOTE_ROOT/$MIGRATION_ID/SHA256SUMS" ]]
@@ -146,7 +146,7 @@ export MOCK_NO_SPACE=1
 expect_failure bash "$TEST_ROOT/host/scripts/export.sh"
 ! grep -q 'docker stop' "$MOCK_LOG"
 unset MOCK_NO_SPACE
-unset APP_CONTAINER
+unset APP_CONTAINER MOCK_STREAM_MOUNTS
 assert_configs_cleaned
 printf 'PASS: integrated export uploads, restarts by default, supports cutover and recovers from failures\n'
 
