@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 source "$(dirname "$0")/common.sh"
 source "$ROOT/scripts/nextcloud.sh"
+source "$ROOT/scripts/progress.sh"
 APP_STOPPED=0
 SUCCESS=0
 EXPORT_STATE_DIR=''
@@ -12,6 +13,7 @@ cleanup() {
   trap - EXIT
   # Repeated Ctrl+C must not abort the attempt to restore the source app.
   trap '' INT TERM
+  progress_stop stopped || true
   if [[ -n "$EXPORT_STATE_DIR" ]]; then
     # The CID file also survives command substitutions used for size estimates.
     if [[ -s "$EXPORT_STATE_DIR/container.cid" ]]; then
@@ -71,10 +73,12 @@ EXPORT_STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/grimmory-export.XXXXXX")"
 MOUNT_KIB=0
 for path in /app/data /books /bookdrop; do
   echo "Estimating $path size using $IMAGE (timeout ${SPACE_SCAN_TIMEOUT}s; large or network libraries can take time)..."
+  progress_start "Estimating $path size"
   # --init forwards interrupts to du; keep its ID in case Docker has to be killed.
   MOUNT_SIZE="$(timeout --kill-after=5 "${SPACE_SCAN_TIMEOUT}s" docker run --rm --init \
     --cidfile "$EXPORT_STATE_DIR/container.cid" --volumes-from "$APP_CONTAINER":ro "$IMAGE" du -sk "$path")" \
     || die "Size scan failed or timed out for $path; check Docker and the backing filesystem, or increase SPACE_SCAN_TIMEOUT for a slow library"
+  progress_stop
   rm -f -- "$EXPORT_STATE_DIR/container.cid"
   MOUNT_SIZE="$(awk '{print $1}' <<< "$MOUNT_SIZE")"
   [[ "$MOUNT_SIZE" =~ ^[0-9]+$ ]] || die "Cannot estimate size of $path"
@@ -82,8 +86,10 @@ for path in /app/data /books /bookdrop; do
   MOUNT_KIB=$((MOUNT_KIB + MOUNT_SIZE))
 done
 echo 'Estimating database size...'
+progress_start 'Estimating database size'
 DB_BYTES="$(docker_check exec -e MYSQL_PWD="$DB_PASSWORD" "$DB_CONTAINER" mariadb --batch --skip-column-names \
   --user="$DB_USER" --database="$DB_NAME" --execute='SELECT COALESCE(SUM(data_length + index_length), 0) FROM information_schema.tables WHERE table_schema = DATABASE();')"
+progress_stop
 AVAILABLE_KIB="$(df -Pk "$(dirname "$OUTPUT")" | awk 'NR==2 {print $4}')"
 [[ "$MOUNT_KIB" =~ ^[0-9]+$ && "$DB_BYTES" =~ ^[0-9]+$ && "$AVAILABLE_KIB" =~ ^[0-9]+$ ]] || die 'Cannot estimate staging space'
 REQUIRED_BYTES=$(( (MOUNT_KIB * 1024 + DB_BYTES) * (100 + SPACE_MARGIN_PERCENT) / 100 + SPACE_MARGIN_BYTES ))
@@ -91,25 +97,37 @@ echo "Estimated staging requirement: $REQUIRED_BYTES bytes; available: $((AVAILA
 (( AVAILABLE_KIB * 1024 >= REQUIRED_BYTES )) || die 'Not enough staging space; set GRIMMORY_TRANSFER_WORKDIR to a larger filesystem'
 
 echo 'Preparing Nextcloud transport...'
+progress_start 'Preparing Nextcloud transport' '' lines
 nextcloud_init
+progress_stop
+progress_start 'Testing Nextcloud access' '' lines
 nextcloud_preflight
+progress_stop
 mkdir -m 700 -- "$OUTPUT"
 echo "Creating Nextcloud pending marker for $MIGRATION_ID..."
+progress_start 'Creating Nextcloud pending marker'
 create_remote_pending_marker "$MIGRATION_ID"
+progress_stop
 printf 'Stopping app to prevent writes during backup...\n'
 APP_STOPPED=1
+progress_start 'Stopping source app'
 docker_check stop "$APP_CONTAINER" >/dev/null
+progress_stop
 printf 'Dumping MariaDB...\n'
+progress_start 'Dumping MariaDB' "$OUTPUT/database.sql"
 docker exec -e MYSQL_PWD="$DB_PASSWORD" "$DB_CONTAINER" mariadb-dump \
   --user="$DB_USER" --single-transaction --quick --routines --events --triggers \
   --hex-blob --no-tablespaces "$DB_NAME" > "$OUTPUT/database.sql"
+progress_stop
 [[ -s "$OUTPUT/database.sql" ]] || die 'Database dump is empty'
 for entry in 'app-data:/app/data' 'books:/books' 'bookdrop:/bookdrop'; do
   name="${entry%%:*}" path="${entry#*:}"
   echo "Archiving $path"
+  progress_start "Archiving $path" "$OUTPUT/$name.tar.gz"
   docker run --rm --init --cidfile "$EXPORT_STATE_DIR/container.cid" \
     --volumes-from "$APP_CONTAINER":ro -v "$OUTPUT:/backup" "$IMAGE" \
     tar -C "$path" -czf "/backup/$name.tar.gz" .
+  progress_stop
   rm -f -- "$EXPORT_STATE_DIR/container.cid"
 done
 cat > "$OUTPUT/manifest.txt" <<MANIFEST
@@ -124,7 +142,9 @@ source_container=$APP_CONTAINER
 mounts=/app/data,/books,/bookdrop
 MANIFEST
 echo 'Calculating backup checksums...'
+progress_start 'Calculating backup checksums'
 (cd "$OUTPUT" && sha256sum "${ARTIFACTS[@]}" > SHA256SUMS)
+progress_stop
 echo 'Verifying and uploading backup...'
 upload_bundle "$OUTPUT" "$MIGRATION_ID"
 SUCCESS=1

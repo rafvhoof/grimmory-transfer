@@ -124,7 +124,11 @@ copy_artifacts() {
 upload_bundle() {
   local directory="$1" migration_id="$2" listing file
   validate_migration_id "$migration_id"
+  # Export provides an activity display for local verification, then hands the
+  # terminal back to rclone's own transfer progress. Other callers work without it.
+  if declare -F progress_start >/dev/null; then progress_start 'Verifying backup checksums and archives' '' lines; fi
   verify_bundle "$directory"
+  if declare -F progress_stop >/dev/null; then progress_stop; fi
   create_remote_pending_marker "$migration_id"
   copy_artifacts "$directory/" "nc:$NC_REMOTE_ROOT/$migration_id/" --immutable
   # Publish checksums only after the parallel copy completes successfully.

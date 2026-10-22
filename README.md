@@ -161,6 +161,8 @@ Nextcloud / GrimmoryMigration / grimmory-YYYYMMDDTHHMMSSZ /
 
 Export prints each preparation step, including a separate size scan for each mount. Short Docker operations have a `DOCKER_TIMEOUT` of 30 seconds; each mount scan has a `SPACE_SCAN_TIMEOUT` of 1800 seconds, including utility image startup or pulling. Both settings accept positive integer seconds in the transfer configuration. Allow more scan time for large or slow network libraries. If one of these bounded operations ignores termination, its Docker client is forcefully stopped after another five seconds. Archives and database dumps have no size-related time limit.
 
+Long export steps show a moving activity bar and elapsed time, refreshed every second in a terminal. Database dumps and archives also show the output size in MiB. The bar indicates that the step is still running; scans do not know the total work in advance, so it does not represent a completion percentage. Redirected output, a `dumb` terminal, and commands with their own status messages get a status line every ten seconds instead. Progress is written to stderr to keep SQL dumps, size estimates and checksum files clean. Uploads use rclone's existing transfer progress.
+
 If export stalls, the last printed step identifies the operation to investigate. A stall at `Checking Docker access` points to Docker access or the daemon; a stall at `Estimating /books size` can also involve utility image startup or the filesystem backing that mount. Inspect the Docker service and source mounts on the source VM. The message `got 3 SIGTERM/SIGINTs, forcefully exiting` comes from Docker after repeated interrupts and does not identify the original cause. Backup helper containers use an init process to forward interrupts, and export attempts to remove an unfinished helper during cleanup.
 
 The script stops Grimmory, leaves MariaDB online, dumps the database, archives the three mounts, records source metadata, verifies the bundle, and uploads it with parallel rclone copies. It publishes `SHA256SUMS` after the other files, checks that all six remote files exist, and removes the pending marker only after success.
@@ -284,6 +286,7 @@ Once the restored instance is working and backed up, choose a newer stable Grimm
 ## Offline checks
 
 ```bash
+bash tests/progress.sh
 bash tests/transfer.sh
 ```
 

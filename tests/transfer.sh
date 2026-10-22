@@ -118,7 +118,12 @@ printf 'PASS: invalid migration paths, missing configuration and invalid command
 # Export exercises source stop/restart and failures without contacting Docker.
 export APP_CONTAINER=booklore MOCK_STREAM_MOUNTS=1
 export MIGRATION_ID=grimmory-20261022T130000Z
-bash "$TEST_ROOT/host/scripts/export.sh" > /dev/null
+bash "$TEST_ROOT/host/scripts/export.sh" > /dev/null 2> "$TEST_ROOT/export-progress.log"
+grep -q '\[done\] Estimating /app/data size' "$TEST_ROOT/export-progress.log"
+grep -q '\[done\] Dumping MariaDB.*written' "$TEST_ROOT/export-progress.log"
+grep -q '\[done\] Archiving /books.*written' "$TEST_ROOT/export-progress.log"
+grep -q '\[done\] Calculating backup checksums' "$TEST_ROOT/export-progress.log"
+grep -q '\[done\] Verifying backup checksums and archives' "$TEST_ROOT/export-progress.log"
 [[ "$(cat "$MOCK_APP_STATE")" == true && -f "$REMOTE_ROOT/$MIGRATION_ID/SHA256SUMS" ]]
 grep -Fxq 'source_container=booklore' "$BACKUP_DIR/$MIGRATION_ID/manifest.txt"
 grep -q '^source_app_repo_digest=ghcr.io/grimmory-tools/grimmory@sha256:' "$BACKUP_DIR/$MIGRATION_ID/manifest.txt"
