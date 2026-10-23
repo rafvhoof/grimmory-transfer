@@ -22,6 +22,42 @@ DB_USER="${DB_USER:-grimmory}"
 IMAGE="${UTILITY_IMAGE:-alpine:3.20}"
 BACKUP_DIR="${GRIMMORY_TRANSFER_WORKDIR:-${BACKUP_DIR:-/var/tmp/grimmory-transfer}}"
 ARTIFACTS=(database.sql app-data.tar.gz books.tar.gz bookdrop.tar.gz manifest.txt)
+BOOKS_MODE=copy
+set_books_mode() {
+  BOOKS_MODE="$1"
+  case "$BOOKS_MODE" in
+    copy) ARTIFACTS=(database.sql app-data.tar.gz books.tar.gz bookdrop.tar.gz manifest.txt) ;;
+    shared) ARTIFACTS=(database.sql app-data.tar.gz bookdrop.tar.gz manifest.txt) ;;
+    *) die "Unsupported books mode: $BOOKS_MODE" ;;
+  esac
+}
+load_bundle_mode() {
+  local format
+  [[ -f "$1/manifest.txt" && ! -L "$1/manifest.txt" ]] || die 'Missing or symlinked backup manifest'
+  format="$(metadata_value "$1" format)"
+  case "$format" in
+    grimmory-transfer-v1)
+      [[ -z "$(metadata_value "$1" books_mode)" ]] || die 'Legacy bundle cannot declare a books mode'
+      set_books_mode copy
+      ;;
+    grimmory-transfer-v2)
+      [[ "$(metadata_value "$1" books_mode)" == shared ]] || die 'Unsupported books mode in v2 bundle'
+      set_books_mode shared
+      ;;
+    *) die 'Unsupported backup format' ;;
+  esac
+}
+reuse_books_setting() {
+  REUSE_EXISTING_BOOKS="${REUSE_EXISTING_BOOKS:-0}"
+  [[ "$REUSE_EXISTING_BOOKS" == 0 || "$REUSE_EXISTING_BOOKS" == 1 ]] || die 'REUSE_EXISTING_BOOKS must be 0 or 1'
+}
+check_shared_books() {
+  local access="$1"
+  # Check through the app's actual /books mount, without traversing the library.
+  docker_check run --rm --volumes-from "$APP_CONTAINER":ro "$IMAGE" sh -c \
+    'test -d /books && test -r /books && test -x /books && test -n "$(ls -A /books)"' \
+    || die "Shared /books is empty or inaccessible on the $access; mount the same Synology library before continuing"
+}
 # Only short Docker operations use this limit; archives and SQL dumps can be large.
 docker_check() {
   local rc
@@ -64,7 +100,8 @@ sha_check() {
     [[ "$line" =~ ^[a-fA-F0-9]{64}[[:space:]][\ \*]([a-zA-Z0-9.-]+)$ ]] || die 'Invalid SHA256SUMS entry'
     file="${BASH_REMATCH[1]}"
     case "$file" in
-      database.sql|app-data.tar.gz|books.tar.gz|bookdrop.tar.gz|manifest.txt) ;;
+      database.sql|app-data.tar.gz|bookdrop.tar.gz|manifest.txt) ;;
+      books.tar.gz) [[ "$BOOKS_MODE" == copy ]] || die 'Shared-books bundle must not contain a books archive checksum' ;;
       *) die "Unexpected checksum path: $file" ;;
     esac
     [[ -z "${seen[$file]:-}" ]] || die "Duplicate checksum for $file"
@@ -73,19 +110,26 @@ sha_check() {
   for file in "${ARTIFACTS[@]}"; do
     [[ -n "${seen[$file]:-}" ]] || die "Missing checksum for $file"
   done
+  [[ "${#seen[@]}" -eq "${#ARTIFACTS[@]}" ]] || die 'Unexpected checksum entries'
   (cd "$1" && sha256sum -c SHA256SUMS)
 }
 verify_bundle() {
   local file
   require sha256sum; require tar
+  load_bundle_mode "$1"
   for file in "${ARTIFACTS[@]}" SHA256SUMS; do
     [[ -f "$1/$file" && ! -L "$1/$file" ]] || die "Missing or symlinked backup artifact: $file"
   done
+  if [[ "$BOOKS_MODE" == shared ]]; then
+    [[ ! -e "$1/books.tar.gz" && ! -L "$1/books.tar.gz" ]] || die 'Shared-books bundle must not contain books.tar.gz'
+  fi
   sha_check "$1"
-  grep -Fxq 'format=grimmory-transfer-v1' "$1/manifest.txt" || die 'Unsupported backup format'
-  for file in app-data.tar.gz books.tar.gz bookdrop.tar.gz; do
+  for file in app-data.tar.gz bookdrop.tar.gz; do
     tar -tzf "$1/$file" >/dev/null || die "Corrupt archive: $file"
   done
+  if [[ "$BOOKS_MODE" == copy ]]; then
+    tar -tzf "$1/books.tar.gz" >/dev/null || die 'Corrupt archive: books.tar.gz'
+  fi
 }
 metadata_value() {
   local line

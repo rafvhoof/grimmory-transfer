@@ -23,7 +23,7 @@ services:
       - "${GRIMMORY_PORT:-6060}:6060"
     volumes:
       - ./grimmory/data:/app/data
-      - ${GRIMMORY_BOOKS_PATH:?Set GRIMMORY_BOOKS_PATH to an empty target library}:/books:${GRIMMORY_BOOKS_ACCESS:-rw}
+      - ${GRIMMORY_BOOKS_PATH:?Set GRIMMORY_BOOKS_PATH to the existing NAS library or an empty target library}:/books:${GRIMMORY_BOOKS_ACCESS:-rw}
       - ./grimmory/bookdrop:/bookdrop
     networks:
       - arr

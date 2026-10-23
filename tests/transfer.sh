@@ -260,3 +260,66 @@ unset MOCK_IMAGE
 bash "$TEST_ROOT/host/scripts/import.sh" "$LEGACY_SOURCE" > /dev/null
 [[ "$(wc -l < "$MOCK_WRITES")" -eq 4 ]]
 printf 'PASS: legacy manifests require matching image references\n'
+
+# Shared Synology books are deliberately absent from both local and remote
+# bundles, while application data and BookDrop still travel with the SQL dump.
+printf 'true\n' > "$MOCK_APP_STATE"
+export APP_CONTAINER=booklore MIGRATION_ID=grimmory-shared-books REUSE_EXISTING_BOOKS=1
+: > "$MOCK_LOG"
+bash "$TEST_ROOT/host/scripts/export.sh" > "$TEST_ROOT/shared-export.log" 2>&1
+SHARED="$BACKUP_DIR/$MIGRATION_ID"
+[[ -f "$SHARED/database.sql" && -f "$SHARED/app-data.tar.gz" && -f "$SHARED/bookdrop.tar.gz" ]]
+[[ ! -e "$SHARED/books.tar.gz" && ! -e "$REMOTE_ROOT/$MIGRATION_ID/books.tar.gz" ]]
+grep -Fxq 'format=grimmory-transfer-v2' "$SHARED/manifest.txt"
+grep -Fxq 'books_mode=shared' "$SHARED/manifest.txt"
+! grep -q 'docker run .*du -sk /books' "$MOCK_LOG"
+! grep -q 'docker run .* -czf /backup/books.tar.gz' "$MOCK_LOG"
+bash "$TEST_ROOT/host/scripts/verify.sh" "$SHARED" > /dev/null
+bash "$TEST_ROOT/host/scripts/transfer.sh" upload "$SHARED" "$MIGRATION_ID" > /dev/null
+bash "$TEST_ROOT/host/scripts/transfer.sh" download "$MIGRATION_ID" "$TEST_ROOT/shared-download" > /dev/null
+[[ ! -e "$TEST_ROOT/shared-download/books.tar.gz" ]]
+cmp "$SHARED/manifest.txt" "$TEST_ROOT/shared-download/manifest.txt"
+unset REUSE_EXISTING_BOOKS
+printf 'false\n' > "$MOCK_APP_STATE"
+export APP_CONTAINER=grimmory DB_CONTAINER=grimmory-db CONFIRM_REPLACE=YES
+: > "$MOCK_WRITES"
+expect_failure bash "$TEST_ROOT/host/scripts/import.sh" "$TEST_ROOT/shared-download"
+grep -q 'set REUSE_EXISTING_BOOKS=1' "$TEST_ROOT/failure.log"
+assert_no_writes
+export REUSE_EXISTING_BOOKS=1 MOCK_SHARED_BOOKS_PRESENT=0
+expect_failure bash "$TEST_ROOT/host/scripts/import.sh" "$TEST_ROOT/shared-download"
+grep -q 'Shared /books is empty or inaccessible' "$TEST_ROOT/failure.log"
+assert_no_writes
+unset MOCK_SHARED_BOOKS_PRESENT
+: > "$MOCK_LOG"
+bash "$TEST_ROOT/host/scripts/import.sh" "$TEST_ROOT/shared-download" > /dev/null
+[[ "$(wc -l < "$MOCK_WRITES")" -eq 3 ]]
+! grep -q 'docker run .* -xzf /backup/books.tar.gz' "$MOCK_LOG"
+! grep -q 'docker run .*test -z .* /books' "$MOCK_LOG"
+grep -q 'docker run .*test -d /books' "$MOCK_LOG"
+printf 'PASS: shared-books export, upload, download and import preserve the existing library\n'
+
+# A copied-books bundle still requires the original empty target checks, and
+# a malformed shared bundle must never reach destination restore commands.
+: > "$MOCK_WRITES"
+expect_failure bash "$TEST_ROOT/host/scripts/import.sh" "$SOURCE"
+grep -q 'set REUSE_EXISTING_BOOKS=0' "$TEST_ROOT/failure.log"
+assert_no_writes
+cp "$SOURCE/books.tar.gz" "$TEST_ROOT/shared-download/books.tar.gz"
+expect_failure bash "$TEST_ROOT/host/scripts/import.sh" "$TEST_ROOT/shared-download"
+grep -q 'must not contain books.tar.gz' "$TEST_ROOT/failure.log"
+assert_no_writes
+rm -f -- "$TEST_ROOT/shared-download/books.tar.gz"
+sed 's/^books_mode=shared$/books_mode=unknown/' "$SHARED/manifest.txt" > "$TEST_ROOT/shared-download/manifest.txt"
+expect_failure bash "$TEST_ROOT/host/scripts/import.sh" "$TEST_ROOT/shared-download"
+grep -q 'Unsupported books mode' "$TEST_ROOT/failure.log"
+assert_no_writes
+cp "$SHARED/manifest.txt" "$TEST_ROOT/shared-download/manifest.txt"
+export APP_CONTAINER=booklore DB_CONTAINER=mariadb MOCK_SHARED_BOOKS_PRESENT=0 MIGRATION_ID=grimmory-shared-missing
+printf 'true\n' > "$MOCK_APP_STATE"
+: > "$MOCK_LOG"
+expect_failure bash "$TEST_ROOT/host/scripts/export.sh"
+! grep -q 'docker stop' "$MOCK_LOG"
+[[ "$(cat "$MOCK_APP_STATE")" == true ]]
+unset MOCK_SHARED_BOOKS_PRESENT REUSE_EXISTING_BOOKS APP_CONTAINER DB_CONTAINER MIGRATION_ID
+printf 'PASS: shared-books mode rejects missing mounts, mode mismatches and malformed bundles\n'

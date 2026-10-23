@@ -47,6 +47,12 @@ trap 'echo "Export terminated; cleaning up..." >&2; exit 143' TERM
 [[ "$LEAVE_GRIMMORY_STOPPED" == 0 || "$LEAVE_GRIMMORY_STOPPED" == 1 ]] || die 'LEAVE_GRIMMORY_STOPPED must be 0 or 1'
 preflight
 assert_mounts
+reuse_books_setting
+if [[ "$REUSE_EXISTING_BOOKS" == 1 ]]; then
+  set_books_mode shared
+  check_shared_books source
+  echo 'Using the existing /books mount on both hosts; books will not be copied.'
+fi
 [[ "$(state "$DB_CONTAINER")" == true ]] || die 'Database must be running'
 [[ "$(state "$APP_CONTAINER")" == true ]] || die 'Application must be running when starting export'
 echo 'Reading source image metadata...'
@@ -72,6 +78,7 @@ SPACE_SCAN_TIMEOUT="${SPACE_SCAN_TIMEOUT:-1800}"
 EXPORT_STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/grimmory-export.XXXXXX")"
 MOUNT_KIB=0
 for path in /app/data /books /bookdrop; do
+  [[ "$BOOKS_MODE" != shared || "$path" != /books ]] || continue
   echo "Estimating $path size using $IMAGE (timeout ${SPACE_SCAN_TIMEOUT}s; large or network libraries can take time)..."
   progress_start "Estimating $path size"
   # --init forwards interrupts to du; keep its ID in case Docker has to be killed.
@@ -122,6 +129,7 @@ progress_stop
 [[ -s "$OUTPUT/database.sql" ]] || die 'Database dump is empty'
 for entry in 'app-data:/app/data' 'books:/books' 'bookdrop:/bookdrop'; do
   name="${entry%%:*}" path="${entry#*:}"
+  [[ "$BOOKS_MODE" != shared || "$path" != /books ]] || continue
   echo "Archiving $path"
   progress_start "Archiving $path" "$OUTPUT/$name.tar.gz"
   docker run --rm --init --cidfile "$EXPORT_STATE_DIR/container.cid" \
@@ -130,8 +138,13 @@ for entry in 'app-data:/app/data' 'books:/books' 'bookdrop:/bookdrop'; do
   progress_stop
   rm -f -- "$EXPORT_STATE_DIR/container.cid"
 done
+if [[ "$BOOKS_MODE" == shared ]]; then
+  BUNDLE_FORMAT=grimmory-transfer-v2
+else
+  BUNDLE_FORMAT=grimmory-transfer-v1
+fi
 cat > "$OUTPUT/manifest.txt" <<MANIFEST
-format=grimmory-transfer-v1
+format=$BUNDLE_FORMAT
 created_utc=$(date -u +%FT%TZ)
 source_app_image=$SOURCE_APP_IMAGE
 source_app_image_id=$SOURCE_APP_IMAGE_ID
@@ -141,6 +154,9 @@ db_name=$DB_NAME
 source_container=$APP_CONTAINER
 mounts=/app/data,/books,/bookdrop
 MANIFEST
+if [[ "$BOOKS_MODE" == shared ]]; then
+  printf 'books_mode=shared\n' >> "$OUTPUT/manifest.txt"
+fi
 echo 'Calculating backup checksums...'
 progress_start 'Calculating backup checksums'
 (cd "$OUTPUT" && sha256sum "${ARTIFACTS[@]}" > SHA256SUMS)

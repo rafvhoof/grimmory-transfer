@@ -137,7 +137,7 @@ upload_bundle() {
   for file in "${ARTIFACTS[@]}" SHA256SUMS; do
     grep -Fxq "$file" <<< "$listing" || die "Remote verification failed: missing $file"
   done
-  [[ "$(printf '%s\n' "$listing" | grep -Fvx UPLOAD-PENDING.txt | wc -l)" -eq 6 ]] || die 'Remote verification failed: unexpected file count'
+  [[ "$(printf '%s\n' "$listing" | grep -Fvx UPLOAD-PENDING.txt | wc -l)" -eq "$((${#ARTIFACTS[@]} + 1))" ]] || die 'Remote verification failed: unexpected file count'
   if grep -Fxq UPLOAD-PENDING.txt <<< "$listing"; then
     nextcloud deletefile "nc:$NC_REMOTE_ROOT/$migration_id/UPLOAD-PENDING.txt"
   fi
@@ -151,10 +151,12 @@ download_bundle() {
   ! grep -Fxq UPLOAD-PENDING.txt <<< "$listing" || die 'Remote bundle is still marked UPLOAD-PENDING; finish the upload first'
   [[ ! -L "$directory" ]] || die "Destination must not be a symlink: $directory"
   mkdir -p -m 700 -- "$directory"
-  for file in "${ARTIFACTS[@]}" SHA256SUMS; do
+  for file in database.sql app-data.tar.gz books.tar.gz bookdrop.tar.gz manifest.txt SHA256SUMS; do
     [[ ! -L "$directory/$file" ]] || die "Destination artifact must not be a symlink: $file"
   done
   nextcloud copyto "nc:$NC_REMOTE_ROOT/$migration_id/SHA256SUMS" "$directory/SHA256SUMS" --ignore-times
+  nextcloud copyto "nc:$NC_REMOTE_ROOT/$migration_id/manifest.txt" "$directory/manifest.txt" --ignore-times
+  load_bundle_mode "$directory"
   copy_artifacts "nc:$NC_REMOTE_ROOT/$migration_id/" "$directory/"
   verify_bundle "$directory"
   echo "Download completed and verified: $directory"

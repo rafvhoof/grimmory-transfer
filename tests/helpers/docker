@@ -56,7 +56,11 @@ case "$command" in
       [[ "${MOCK_FAIL_SCAN:-0}" == 0 ]] || exit 36
       printf '1 %s\n' "${@: -1}"
     elif [[ " $* " == *' sh -c '* ]]; then
-      [[ "${MOCK_NONEMPTY_MOUNT:-0}" == 0 ]]
+      if [[ " $* " == *'test -d /books'* ]]; then
+        [[ "${MOCK_SHARED_BOOKS_PRESENT:-1}" == 1 ]]
+      else
+        [[ "${MOCK_NONEMPTY_MOUNT:-0}" == 0 ]]
+      fi
     elif [[ " $* " == *' -czf '* ]]; then
       [[ "${MOCK_FAIL_ARCHIVE:-0}" == 0 ]] || exit 37
       if [[ -n "${MOCK_SIGNAL_EXPORT:-}" ]]; then

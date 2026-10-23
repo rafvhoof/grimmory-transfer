@@ -4,7 +4,7 @@ Migrate a standalone Docker-hosted Grimmory instance into another Docker Compose
 
 This preserves users, reading progress, books, metadata, application files and BookDrop contents **when they are stored in the database and mounts below**.
 
-> **Empty target required.** The destination database must have zero tables and `/app/data`, `/books` and `/bookdrop` must be empty. This tool never merges or deletes destination content. Keep the source VM and backups until migration is validated. Never commit credentials or backup data.
+> **Fresh destination required.** The destination database must have zero tables, and `/app/data` and `/bookdrop` must be empty. By default, `/books` must also be empty. With `REUSE_EXISTING_BOOKS=1` on both hosts, `/books` must instead contain the same existing Synology library. The tool never merges or deletes destination content. Keep the source VM and backups until migration is validated. Never commit credentials or backup data.
 
 ## Comparison with the Paperless transfer
 
@@ -15,11 +15,11 @@ This preserves users, reading progress, books, metadata, application files and B
 | Transport | Authenticated Nextcloud WebDAV via rclone | Same; temporary mode-600 configuration, parallel copies, retries and progress |
 | Source preparation | Check staging space and Nextcloud before stopping services | Same checks before stopping the Grimmory app; MariaDB stays running |
 | Bundle selection | `MIGRATION_ID` or latest timestamped folder | Same; automatic selection skips pending or incomplete uploads |
-| Payload | Native document export, configuration and PostgreSQL recovery dump | Logical MariaDB dump and three mount archives |
+| Payload | Native document export, configuration and PostgreSQL recovery dump | Logical MariaDB dump and two or three mount archives |
 | Cutover | Leaves source stopped after success by default | Automatic restart remains the default; explicitly set `LEAVE_GRIMMORY_STOPPED=1` for final cutover |
-| Destination checks | Matching version and empty destination | Matching Grimmory image, zero DB tables and three empty mounts; no bypass |
+| Destination checks | Matching version and empty destination | Matching Grimmory image, zero DB tables, empty app data and BookDrop; `/books` must be empty for a copied library or accessible and nonempty for shared books |
 
-Grimmory needs filesystem archives to preserve its Docker mount contents and Unix metadata. These are transferred individually; there is no additional tar/zip containing the complete bundle, so only one staging copy is needed.
+Grimmory needs filesystem archives to preserve its Docker mount contents and Unix metadata. These are transferred individually; there is no additional tar/zip containing the complete bundle, so only one staging copy is needed. If both hosts mount the same existing Synology library, the shared-books option leaves `/books` on the NAS and archives only the other two mounts.
 
 ## What is included
 
@@ -27,12 +27,12 @@ Grimmory needs filesystem archives to preserve its Docker mount contents and Uni
 |---|---|---|
 | MariaDB database | `database.sql` | Users, libraries, reading state, shelves and other DB records |
 | `/app/data` | `app-data.tar.gz` | Application state, covers, metadata cache and uploaded data |
-| `/books` | `books.tar.gz` | Managed book library |
+| `/books` | `books.tar.gz` in the default mode; no archive in shared-books mode | Managed book library, or the existing Synology library mounted on both hosts |
 | `/bookdrop` | `bookdrop.tar.gz` | Incoming book files |
 | Docker inspection | `manifest.txt` | Source image reference, image ID, registry digest, database name and mount paths |
-| Bundle files | `SHA256SUMS` | SHA-256 checksums for all five artifacts |
+| Bundle files | `SHA256SUMS` | SHA-256 checksums for all five default artifacts or four shared-books artifacts |
 
-The app must have **three separate Docker mounts at those exact container paths**. Extra library mounts, externally referenced files, symlink targets, configuration outside these mounts, external authentication and reverse proxy secrets need separate migration. Source `.env` and Compose secrets are not exported; reconfigure applicable settings on the new host.
+The app must have **three separate Docker mounts at those exact container paths**. Extra library mounts, externally referenced files, symlink targets, configuration outside these mounts, external authentication and reverse proxy secrets need separate migration. Source `.env` and Compose secrets are not exported; reconfigure applicable settings on the new host. A shared-books bundle does not back up the Synology files: retain a separate NAS backup or snapshot.
 
 ## Your existing BookLore-era source
 
@@ -44,7 +44,7 @@ Your supplied Compose file already uses `ghcr.io/grimmory-tools/grimmory:latest`
 | Database service/container | `mariadb` | `grimmory-db` |
 | MariaDB image | `lscr.io/linuxserver/mariadb:11.4.5` | `lscr.io/linuxserver/mariadb:11.4.8`, as in the upstream Compose example |
 | App data | `/mnt/booklore/data` | `./grimmory/data` in Arr stack |
-| Books | `/mnt/booklore/books` | `/mnt/media/books`, or another empty destination library |
+| Books | `/mnt/booklore/books` | The same Synology library under `/books` in shared mode, or an empty destination library in default mode |
 | BookDrop | `/mnt/booklore/bookdrop` | `./grimmory/bookdrop` in Arr stack |
 | Database files | `./mariadb/config` on source | `./grimmory/database` on destination; migrated by SQL dump |
 | App port setting | `BOOKLORE_PORT` | `SERVER_PORT=6060` inside Docker; `GRIMMORY_PORT` selects the host port |
@@ -121,6 +121,8 @@ docker inspect mariadb --format '{{.Config.Image}}'
 
 On the destination, inspect `grimmory` and `grimmory-db` instead. Use actual container names, which may be prefixed by a Compose project. Preserve `/app/data`, `/books` and `/bookdrop` inside the destination app. For NFS-backed ebooks, mount the share on the host and bind it to `/books`; verify permissions and Grimmory's `DISK_TYPE=NETWORK` setting when applicable.
 
+To reuse the existing Synology books, confirm that both `/books` mounts expose the **same files at the same relative paths**. The host mount paths may differ. The scripts can check that `/books` is accessible and nonempty, but cannot prove two hosts are viewing the same NAS share. Keep other writers stopped during the final export and import so the library and database stay in sync.
+
 The default local staging directory on both hosts is:
 
 ```text
@@ -145,6 +147,10 @@ Take a VM backup or snapshot first. Run:
 sudo bash scripts/export.sh
 ```
 
+For books already on the same Synology share, add `REUSE_EXISTING_BOOKS=1` to `/etc/grimmory-transfer.env` on **both hosts** before export and import. This mode skips the `/books` size scan and archive; the bundle uses format `grimmory-transfer-v2` and contains `database.sql`, `app-data.tar.gz`, `bookdrop.tar.gz`, `manifest.txt` and `SHA256SUMS`. The default remains a full `grimmory-transfer-v1` bundle including `books.tar.gz`. The import reads the bundle's mode and rejects a mismatch with the destination setting.
+
+The `/app/data` scan and archive still run in shared-books mode. If that is the slow step on your source host, reusing `/books` will not shorten it.
+
 For the **final cutover**, explicitly opt into leaving the source app stopped:
 
 ```bash
@@ -159,13 +165,13 @@ Before stopping the app, export checks the containers, mounts, available staging
 Nextcloud / GrimmoryMigration / grimmory-YYYYMMDDTHHMMSSZ /
 ```
 
-Export prints each preparation step, including a separate size scan for each mount. Short Docker operations have a `DOCKER_TIMEOUT` of 30 seconds; each mount scan has a `SPACE_SCAN_TIMEOUT` of 1800 seconds, including utility image startup or pulling. Both settings accept positive integer seconds in the transfer configuration. Allow more scan time for large or slow network libraries. If one of these bounded operations ignores termination, its Docker client is forcefully stopped after another five seconds. Archives and database dumps have no size-related time limit.
+Export prints each preparation step, including a separate size scan for each exported mount. Short Docker operations have a `DOCKER_TIMEOUT` of 30 seconds; each mount scan has a `SPACE_SCAN_TIMEOUT` of 1800 seconds, including utility image startup or pulling. Both settings accept positive integer seconds in the transfer configuration. Allow more scan time for large or slow network libraries. If one of these bounded operations ignores termination, its Docker client is forcefully stopped after another five seconds. Archives and database dumps have no size-related time limit.
 
 Long export steps show a moving activity bar and elapsed time, refreshed every second in a terminal. Database dumps and archives also show the output size in MiB. The bar indicates that the step is still running; scans do not know the total work in advance, so it does not represent a completion percentage. Redirected output, a `dumb` terminal, and commands with their own status messages get a status line every ten seconds instead. Progress is written to stderr to keep SQL dumps, size estimates and checksum files clean. Uploads use rclone's existing transfer progress.
 
 If export stalls, the last printed step identifies the operation to investigate. A stall at `Checking Docker access` points to Docker access or the daemon; a stall at `Estimating /books size` can also involve utility image startup or the filesystem backing that mount. Inspect the Docker service and source mounts on the source VM. The message `got 3 SIGTERM/SIGINTs, forcefully exiting` comes from Docker after repeated interrupts and does not identify the original cause. Backup helper containers use an init process to forward interrupts, and export attempts to remove an unfinished helper during cleanup.
 
-The script stops Grimmory, leaves MariaDB online, dumps the database, archives the three mounts, records source metadata, verifies the bundle, and uploads it with parallel rclone copies. It publishes `SHA256SUMS` after the other files, checks that all six remote files exist, and removes the pending marker only after success.
+The script stops Grimmory, leaves MariaDB online, dumps the database, archives the selected mounts, records source metadata, verifies the bundle, and uploads it with parallel rclone copies. It publishes `SHA256SUMS` after the other files, checks the remote file count for the bundle mode, and removes the pending marker only after success.
 
 On any export/upload failure or interrupt after stopping the app, it attempts to restart the source. On success it restarts the app unless `LEAVE_GRIMMORY_STOPPED=1`. For final cutover, keep the old app stopped and do not allow further changes after the snapshot.
 
@@ -196,11 +202,11 @@ Set these values before creating containers:
 | `DB_USER_ID` / `DB_GROUP_ID` | Desired owner of target MariaDB files; compare with the source's values |
 | `TZ` | Keep your existing timezone |
 | `GRIMMORY_PORT` | Existing `BOOKLORE_PORT` value if you want to keep the external port; otherwise `6060` |
-| `GRIMMORY_BOOKS_PATH` | Empty target library, default `/mnt/media/books` on the mounted NAS |
+| `GRIMMORY_BOOKS_PATH` | The same Synology library in shared mode, or an empty target library in default mode |
 | `GRIMMORY_DISK_TYPE` | `NETWORK` for NFS/SMB, `LOCAL` for local disk |
-| `GRIMMORY_BOOKS_ACCESS` | `rw` during restore |
+| `GRIMMORY_BOOKS_ACCESS` | `rw` for a copied library during restore; in shared mode choose `ro` or `rw` according to how the library is managed |
 
-Both passwords and the image are required, so an unconfigured example fails Compose validation. For a Bindery-managed library, stop acquisition and any other writers during the migration; the destination library must still be empty. After validation, you can change `GRIMMORY_BOOKS_ACCESS` to `ro` and recreate the Grimmory container to restore the Arr stack's read-only library policy.
+Both passwords and the image are required, so an unconfigured example fails Compose validation. For a Bindery-managed library, stop acquisition and any other writers during the migration. In default mode the destination library must be empty; in shared mode it must be the existing library. After a copied-library restore, you can change `GRIMMORY_BOOKS_ACCESS` to `ro` and recreate the Grimmory container to restore the Arr stack's read-only library policy.
 
 Create the Grimmory container without starting the app; start only its database:
 
@@ -214,7 +220,7 @@ docker compose stop grimmory
 
 The image's normal healthcheck targets the internal port 6060, independent of the chosen host port. The transfer configuration on this host must use `APP_CONTAINER=grimmory`, `DB_CONTAINER=grimmory-db`, `DB_NAME=<GRIMMORY_DB_NAME>`, `DB_USER=<GRIMMORY_DB_USER>` and `DB_PASSWORD=<GRIMMORY_DB_PASSWORD>`.
 
-Substitute your actual service names if different. An initialized destination requires a separate verified backup and deliberately provisioned fresh database and mounts. The import never deletes existing data and has no nonempty-target bypass. Leave the source Compose and live database storage intact.
+Substitute your actual service names if different. An initialized destination requires a separate verified backup and deliberately provisioned fresh database and app-data/BookDrop mounts. The import never deletes existing data. Shared mode permits an existing nonempty `/books` mount and does not write to it. Leave the source Compose and live database storage intact.
 
 ## 5. Download and import on the destination VM
 
@@ -227,9 +233,9 @@ sudo env CONFIRM_REPLACE=YES bash scripts/import.sh
 
 Without an argument, import selects the newest completed `grimmory-YYYYMMDDTHHMMSSZ` folder under `NC_REMOTE_ROOT`, skipping folders with no `SHA256SUMS` or an `UPLOAD-PENDING.txt` marker. Set `MIGRATION_ID` in the configuration to choose a specific bundle, including one with a custom name.
 
-Import downloads into the local staging directory, verifies all five artifact checksums and the three archives, and checks the source Grimmory image against the destination. If the bundle records an image ID, identical image contents are required even when tag/digest references differ; older bundles without an ID require the same image reference. It also checks the source database name when recorded. It reads metadata as text, never as executable shell configuration.
+Import downloads into the local staging directory, verifies the checksums and archives required by the bundle mode, and checks the source Grimmory image against the destination. If the bundle records an image ID, identical image contents are required even when tag/digest references differ; older bundles without an ID require the same image reference. It also checks the source database name when recorded. It reads metadata as text, never as executable shell configuration.
 
-Before restoring anything, import also requires the destination app to be stopped, MariaDB to be running, the database to have zero tables and all three mounts to be empty. `CONFIRM_REPLACE=YES` is an acknowledgement, not an override of these checks. It restores mount contents and imports the SQL dump, retaining the downloaded bundle.
+Before restoring anything, import also requires the destination app to be stopped, MariaDB to be running, the database to have zero tables, and `/app/data` and `/bookdrop` to be empty. For a default bundle `/books` must be empty. For a shared-books bundle, `REUSE_EXISTING_BOOKS=1` must be set on the destination and `/books` must be accessible and nonempty; import leaves its contents untouched. `CONFIRM_REPLACE=YES` acknowledges the database and app-data restore; it does not bypass these checks. Import retains the downloaded bundle.
 
 Start Grimmory only after a successful import:
 
